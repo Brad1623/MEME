@@ -444,5 +444,33 @@ def status():
     return html, 200
 
 
+@app.route("/export")
+def export():
+    """perf/archive/trades 원본 덤프 — 배점 자기교정 분석용 (읽기전용)."""
+    try:
+        cmds = [
+            ["LRANGE", "perf:done", 0, 199],
+            ["LRANGE", "archive:alerts", 0, 49],
+            ["LRANGE", "trades:done", 0, 99],
+            ["GET", "perf:summary"],
+            ["GET", "perf:summary_shadow"],
+        ]
+        resp = requests.post(
+            screener.UPSTASH_URL + "/pipeline",
+            headers={"Authorization": f"Bearer {screener.UPSTASH_TOKEN}"},
+            json=cmds, timeout=5,
+        )
+        vals = [r.get("result") if isinstance(r, dict) else None for r in resp.json()]
+        return {
+            "perf_done": vals[0] or [],
+            "archive": vals[1] or [],
+            "trades": vals[2] or [],
+            "perf_summary": vals[3],
+            "perf_summary_shadow": vals[4],
+        }, 200
+    except Exception as e:
+        return {"error": str(e)}, 500
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)

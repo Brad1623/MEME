@@ -121,6 +121,26 @@ def r_cmd(*args):
         return None
 
 
+def r_pipe(commands):
+    """여러 Redis 명령을 파이프라인 1회 요청으로 실행 (커맨드 수 절감 핵심).
+    commands: [["GET","k1"], ["GET","k2"], ...]. 반환: [result1, result2, ...].
+    실패 시 [None]*len(commands)."""
+    if not commands:
+        return []
+    try:
+        resp = requests.post(
+            UPSTASH_URL + "/pipeline",
+            headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
+            json=[[str(a) for a in cmd] for cmd in commands],
+            timeout=15,
+        )
+        out = resp.json()
+        return [r.get("result") if isinstance(r, dict) else None for r in out]
+    except Exception as e:
+        print(f"[redis] pipeline error: {e}")
+        return [None] * len(commands)
+
+
 def archive_alert(kind, sym, score, pair, tag_verdict=None):
     """발송된 알림을 아카이브 리스트에 기록 (최근 50개 유지).
     kind: 'pump'(급등) / 'dip'(눌림목).
@@ -144,7 +164,8 @@ def archive_alert(kind, sym, score, pair, tag_verdict=None):
 def market_activity(pairs):
     """시장 전체 활성도 지수. 지금 median 거래량비 ÷ 최근 24h 시간대별 baseline.
     반환: 0.3~2.0 (1.0=평시, 0.5=한산 → 미국새벽 등).
-    baseline 부족(3시간 미만)이면 1.0 반환 = 보정 안 함."""
+    baseline 부족(3시간 미만)이면 1.0 반환 = 보정 안 함.
+    ★ Redis 절감: baseline 조회+락체크를 파이프라인 1회로, 저장도 묶음."""
     ratios = []
     for p in pairs.values():
         vol = p.get("volume") or {}
@@ -156,28 +177,33 @@ def market_activity(pairs):
         return 1.0
     ratios.sort()
     now_med = ratios[len(ratios) // 2]
-    r_cmd("SET", "mkt:now", round(now_med, 3))
 
-    # 시간당 1샘플로 baseline 축적 (최근 24개 = 24h 프로파일)
-    if not r_cmd("GET", "mkt:hourlock"):
-        r_cmd("SETEX", "mkt:hourlock", 3300, "1")   # 55분 락
-        r_cmd("LPUSH", "mkt:base", round(now_med, 3))
-        r_cmd("LTRIM", "mkt:base", 0, 23)
+    # baseline 리스트 + 시간락을 1회 파이프라인으로 조회
+    res = r_pipe([["LRANGE", "mkt:base", 0, 23], ["GET", "mkt:hourlock"]])
+    base_list = res[0] or []
+    hourlock = res[1]
+
+    # 시간당 1샘플 축적 (락 없을 때만) — 저장 명령들 묶음
+    writes = [["SET", "mkt:now", round(now_med, 3)]]
+    if not hourlock:
+        writes.append(["SETEX", "mkt:hourlock", 3300, "1"])
+        writes.append(["LPUSH", "mkt:base", round(now_med, 3)])
+        writes.append(["LTRIM", "mkt:base", 0, 23])
 
     vals = []
-    for x in (r_cmd("LRANGE", "mkt:base", 0, 23) or []):
+    for x in base_list:
         try:
             vals.append(float(x))
         except (ValueError, TypeError):
             pass
-    if len(vals) < 3:
-        return 1.0     # 데이터 부족 → 보정 없이 원래 기준 사용
-    vals.sort()
-    base = vals[len(vals) // 2]
-    if base <= 0:
-        return 1.0
-    act = max(0.3, min(2.0, now_med / base))
-    r_cmd("SET", "mkt:activity", round(act, 2))
+    act = 1.0
+    if len(vals) >= 3:
+        vals.sort()
+        base = vals[len(vals) // 2]
+        if base > 0:
+            act = max(0.3, min(2.0, now_med / base))
+            writes.append(["SET", "mkt:activity", round(act, 2)])
+    r_pipe(writes)
     return act
 
 
@@ -240,16 +266,25 @@ def check_sell(pair, entry=None, activity=1.0):
 def positions_tick(pairs, activity=1.0):
     """매 사이클 포지션 감시: 위험도 점수 알림 + 익절 알림 + 스냅샷 기록."""
     mints = r_cmd("SMEMBERS", "pos:index") or []
+    if not mints:
+        r_cmd("SET", "pos:snapshot", "[]")
+        return
+    # 포지션 정보 + 손절 쿨다운을 1회 파이프라인으로 조회
+    raws = r_pipe([["GET", f"pos:{m}"] for m in mints]
+                  + [["GET", f"slcd:{m}"] for m in mints])
+    pos_raws = raws[:len(mints)]
+    slcd_flags = raws[len(mints):]
     snapshot = []
-    for mint in mints:
-        raw = r_cmd("GET", f"pos:{mint}")
+    stale = []
+    for idx, mint in enumerate(mints):
+        raw = pos_raws[idx]
         if not raw:
-            r_cmd("SREM", "pos:index", mint)
+            stale.append(["SREM", "pos:index", mint])
             continue
         try:
             pos = json.loads(raw)
         except Exception:
-            r_cmd("SREM", "pos:index", mint)
+            stale.append(["SREM", "pos:index", mint])
             continue
         pair = pairs.get(mint)
         if not pair:
@@ -264,7 +299,7 @@ def positions_tick(pairs, activity=1.0):
 
         # 🛑 손절선 알림 (최우선 — 위험도 점수와 무관, 15분 쿨다운)
         sl = float(pos.get("sl") or SELL_SL_PCT)
-        if pnl is not None and pnl <= -sl and not r_cmd("GET", f"slcd:{mint}"):
+        if pnl is not None and pnl <= -sl and not slcd_flags[idx]:
             r_cmd("SETEX", f"slcd:{mint}", SELL_CRASH_CD, "1")
             tg_send(f"🛑 <b>[손절선 도달] {sym}</b>  손절기준 -{sl:g}%{pnl_txt}\n"
                     f"규칙대로면 지금 정리. 위험도 {score:.0f}/100\n"
@@ -310,7 +345,7 @@ def positions_tick(pairs, activity=1.0):
         snapshot.append({"sym": sym, "entry": pos.get("entry"), "price": price,
                          "pnl": round(pnl, 1) if pnl is not None else None,
                          "risk": score})
-    r_cmd("SET", "pos:snapshot", json.dumps(snapshot))
+    r_pipe(stale + [["SET", "pos:snapshot", json.dumps(snapshot)]])
 
 
 # ============================================================
@@ -329,20 +364,30 @@ def perf_add(mint, sym, kind, price):
 
 
 def perf_tick(pairs):
-    """추적중 코인 갱신: 최고/최저 업데이트, 1h/6h/24h 수익률 확정, 완료 시 집계."""
+    """추적중 코인 갱신: 최고/최저 업데이트, 1h/6h/24h 수익률 확정, 완료 시 집계.
+    ★ Redis 절감: 개별 GET/SET을 파이프라인으로 일괄 처리."""
     if not PERF_ENABLE:
         return
     keys = r_cmd("SMEMBERS", "perf:index") or []
     now = int(time.time())
-    for k in keys:
-        raw = r_cmd("GET", k)
+    if not keys:
+        _perf_summarize()
+        return
+
+    # ① 전체 항목 1회 파이프라인으로 조회 (기존: 항목당 GET N회 → 1회)
+    raws = r_pipe([["GET", k] for k in keys])
+
+    writes = []       # 갱신 SET 묶음
+    cleanups = []     # 완료/무효 항목 정리 묶음
+    done_push = []    # perf:done 추가 묶음
+    for k, raw in zip(keys, raws):
         if not raw:
-            r_cmd("SREM", "perf:index", k)
+            cleanups.append(["SREM", "perf:index", k])
             continue
         try:
             it = json.loads(raw)
         except Exception:
-            r_cmd("SREM", "perf:index", k)
+            cleanups.append(["SREM", "perf:index", k])
             continue
         pair = pairs.get(it["mint"])
         if pair:
@@ -358,26 +403,36 @@ def perf_tick(pairs):
                     it["r6"] = round(pnl, 1)
                 if it["r24"] is None and age >= 86400:
                     it["r24"] = round(pnl, 1)
-        # 완료(24h 기록됨) 또는 25h 초과(데이터 소실)면 종료 처리
         if it["r24"] is not None or (now - it["ts"]) > 90000:
-            r_cmd("LPUSH", "perf:done", json.dumps(it))
-            r_cmd("LTRIM", "perf:done", 0, 199)
-            r_cmd("SREM", "perf:index", k)
-            r_cmd("DEL", k)
+            done_push.append(["LPUSH", "perf:done", json.dumps(it)])
+            cleanups.append(["SREM", "perf:index", k])
+            cleanups.append(["DEL", k])
         else:
-            r_cmd("SET", k, json.dumps(it))
+            writes.append(["SET", k, json.dumps(it)])
 
-    # 요약 집계 (최근 완료 100건) → /status 표시용
-    # ★ alert(pump/dip)와 shadow(20분미만 실험군)를 분리 집계 — 섞으면 "알림 성과" 지표가 왜곡됨
+    # ② 갱신·완료·정리를 파이프라인으로 일괄 실행
+    batch = writes + done_push
+    if done_push:
+        batch.append(["LTRIM", "perf:done", 0, 199])
+    batch += cleanups
+    if batch:
+        r_pipe(batch)
+
+    _perf_summarize()
+
+
+def _perf_summarize():
+    """완료 기록으로 요약 재계산 (alert vs shadow 분리). perf_tick에서 호출."""
     done = r_cmd("LRANGE", "perf:done", 0, 199) or []
-    if done:
-        items = []
-        for x in done:
-            try:
-                items.append(json.loads(x))
-            except Exception:
-                pass
-
+    if not done:
+        return
+    items = []
+    for x in done:
+        try:
+            items.append(json.loads(x))
+        except Exception:
+            pass
+    if True:
         def med(a):
             a = sorted(v for v in a if v is not None)
             return a[len(a)//2] if a else None
@@ -400,11 +455,14 @@ def perf_tick(pairs):
         alert_items = [i for i in items if i.get("kind") in ("pump", "dip")]
         shadow_items = [i for i in items if i.get("kind") == "shadow"]
         s1 = summarize(alert_items)
-        if s1:
-            r_cmd("SET", "perf:summary", json.dumps(s1))
         s2 = summarize(shadow_items)
+        sets = []
+        if s1:
+            sets.append(["SET", "perf:summary", json.dumps(s1)])
         if s2:
-            r_cmd("SET", "perf:summary_shadow", json.dumps(s2))
+            sets.append(["SET", "perf:summary_shadow", json.dumps(s2)])
+        if sets:
+            r_pipe(sets)
 
 
 # ============================================================
@@ -1086,26 +1144,16 @@ def send_dip_alert(pair, reasons, warns, top_holder_pct=None, detect_ts=None):
         f"{risk_line}"
     )
 
-    tag_lines = ""
-    if tag_verdict:
-        tag_lines = f"\n📋 {tag_verdict}"
-        for t in pos_tags + cau_tags:
-            tag_lines += f"\n  {t}"
     detail = (
-        f"<tg-spoiler>"
-        f"💰 ${price} | 💧유동성 {liq} | 거래량 1h {v1}\n"
-        f"🔄 매수{txns.get('buys','?')}/매도{txns.get('sells','?')}\n"
-        f"🎯 {reason_line}\n"
-        f"💬 {verdict}"
-        f"{tag_lines}"
-        f"</tg-spoiler>"
+        f"💰 ${price} · 💧{liq} · 거래량 {v1}\n"
+        f"📊 매수/매도 {txns.get('buys','?')}/{txns.get('sells','?')} · 🎯{reason_line}"
     )
 
     msg = (
-        f"{header}\n\n{detail}\n\n"
+        f"{header}\n{detail}\n"
         f"<code>{mint}</code>\n"
-        f'📊 <a href="https://dexscreener.com/solana/{pair.get("pairAddress","")}">차트</a> · '
-        f'🛡 <a href="https://rugcheck.xyz/tokens/{mint}">Rug</a>'
+        f'<a href="https://dexscreener.com/solana/{pair.get("pairAddress","")}">차트</a> · '
+        f'<a href="https://rugcheck.xyz/tokens/{mint}">Rug</a>'
     )
     return tg_send(msg, detect_ts=detect_ts, buttons=[(f"📌 진입 등록 (현재가·손절-{SELL_SL_PCT:g}%)", f"reg:{mint}")])
 
@@ -1333,27 +1381,17 @@ def send_alert(pair, score, reasons, dangers, warns, top_holder_pct=None, detect
         f"💡 {guide}"
     )
 
-    # ── 탭하면 펼쳐지는 상세 (전체 수치·근거) ──
-    tag_lines = ""
-    if tag_verdict:
-        tag_lines = f"\n📋 {tag_verdict}"
-        for t in pos_tags + cau_tags:
-            tag_lines += f"\n  {t}"
+    # 핵심 수치 2줄만 (스포일러 미지원 클라이언트 대응 — 짧게 쳐냄)
     detail = (
-        f"<tg-spoiler>"
-        f"💰 ${price} | 💧유동성 {liq} | 거래량 1h {v1}/24h {v24}\n"
-        f"📈 5m {pc.get('m5','?')}% · 매수{txns.get('buys','?')}/매도{txns.get('sells','?')}\n"
-        f"🎯 {reason_line}\n"
-        f"💬 {verdict}"
-        f"{tag_lines}"
-        f"</tg-spoiler>"
+        f"💰 ${price} · 💧{liq} · 거래량 {v1}\n"
+        f"📊 5m {pc.get('m5','?')}% · 매수/매도 {txns.get('buys','?')}/{txns.get('sells','?')} · 🎯{reason_line}"
     )
 
     msg = (
-        f"{header}\n\n{detail}\n\n"
+        f"{header}\n{detail}\n"
         f"<code>{mint}</code>\n"
-        f'📊 <a href="https://dexscreener.com/solana/{pair.get("pairAddress","")}">차트</a> · '
-        f'🛡 <a href="https://rugcheck.xyz/tokens/{mint}">Rug</a>'
+        f'<a href="https://dexscreener.com/solana/{pair.get("pairAddress","")}">차트</a> · '
+        f'<a href="https://rugcheck.xyz/tokens/{mint}">Rug</a>'
     )
     return tg_send(msg, detect_ts=detect_ts, buttons=[(f"📌 진입 등록 (현재가·손절-{SELL_SL_PCT:g}%)", f"reg:{mint}")])
 
@@ -1520,10 +1558,13 @@ def main():
                     time.sleep(1)
 
             # ---- 포지션 매도감시 + 알림 성과추적 (매 사이클) ----
+            # 포지션 감시(손절/익절)는 매 사이클 — 지연되면 안 되는 신호
             activity = market_activity(pairs)
             positions_tick(pairs, activity)
-            perf_tick(pairs)
-            shadow_tick(pairs)
+            # 성과추적/섀도우는 3사이클(약 6분)마다 — 가격 추적엔 충분, Redis 절감
+            if cycle % 3 == 0:
+                perf_tick(pairs)
+                shadow_tick(pairs)
 
         except Exception:
             print(f"[cycle {cycle}] fatal:\n{traceback.format_exc()}")
