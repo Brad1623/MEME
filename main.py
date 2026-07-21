@@ -74,6 +74,16 @@ PERF_ENABLE    = os.getenv("PERF_ENABLE", "1") == "1"              # 알림코�
 SHADOW_ENABLE  = os.getenv("SHADOW_ENABLE", "1") == "1"
 SHADOW_TTL     = int(os.getenv("SHADOW_TTL_SEC", "10800"))         # 중복 추적 방지 3시간
 
+# --- 2단 눌림(더블딥) 관찰 트래커 (알림 없이 검증 전용, 2026-07-21) ---
+# 가설: 신생코인이 1차 얕은 눌림(-10%) 후 반등, 다시 2차 깊은 눌림(-30%)이 오면
+#       그 시점이 좋은 진입점이다 — 아직 검증 안 됨, forward-test로 데이터부터 쌓음
+DOUBLEDIP_ENABLE   = os.getenv("DOUBLEDIP_ENABLE", "1") == "1"
+DOUBLEDIP_MC_MIN   = float(os.getenv("DOUBLEDIP_MC_MIN", "500000"))  # 대상 하한: 시총 $500K (전문가 스위트스팟 하한)
+DOUBLEDIP_D1_PCT   = float(os.getenv("DOUBLEDIP_D1_PCT", "10"))      # 1차 눌림: 고점 대비 -10% 이내
+DOUBLEDIP_D2_PCT   = float(os.getenv("DOUBLEDIP_D2_PCT", "30"))      # 2차 눌림: 반등고점 대비 -30% 수준
+DOUBLEDIP_WINDOW_S = int(os.getenv("DOUBLEDIP_WINDOW_SEC", "3600"))  # 1차→2차 시간제한 1시간
+DOUBLEDIP_STATE_TTL = int(os.getenv("DOUBLEDIP_STATE_TTL_SEC", "7200"))  # 상태 보관 2시간(윈도우+여유)
+
 # --- 원클릭 매수 버튼 ---
 # 알림에 표시할 SOL 매수 금액 세트 (쉼표 구분). 누르면 Jupiter 스왑 페이지가 해당 금액으로 열림
 BUY_AMOUNTS = [a.strip() for a in os.getenv("BUY_AMOUNTS_SOL", "0.5,1,2").split(",") if a.strip()]
@@ -454,13 +464,17 @@ def _perf_summarize():
 
         alert_items = [i for i in items if i.get("kind") in ("pump", "dip")]
         shadow_items = [i for i in items if i.get("kind") == "shadow"]
+        dd_items = [i for i in items if i.get("kind") == "doubledip"]
         s1 = summarize(alert_items)
         s2 = summarize(shadow_items)
+        s3 = summarize(dd_items)
         sets = []
         if s1:
             sets.append(["SET", "perf:summary", json.dumps(s1)])
         if s2:
             sets.append(["SET", "perf:summary_shadow", json.dumps(s2)])
+        if s3:
+            sets.append(["SET", "perf:summary_doubledip", json.dumps(s3)])
         if sets:
             r_pipe(sets)
 
@@ -1040,6 +1054,83 @@ def shadow_tick(pairs):
         print(f"[SHADOW] {sym} 추적시작 (20분 미만, 알림없음)")
 
 
+def doubledip_tick(pairs):
+    """2단 눌림(더블딥) 관찰 트래커 — 알림 없이 상태만 추적, 검증목적.
+    상태(코인별 doubledip:{mint}): {stage, swing_high, bounce_high, d1_ts}
+      stage 0(암묵) → 고점 갱신만
+      stage 1: 1차 눌림(-10%) 감지 → swing_high 기록, 반등 대기
+      stage 2: 반등해서 bounce_high 갱신 중
+      확정: bounce_high 대비 -30% 눌림이 1차 눌림 후 1시간 이내 발생 → perf 등록(kind='doubledip')
+    ★ Redis 절감: 대상 코인 상태를 파이프라인으로 일괄 조회."""
+    if not (DOUBLEDIP_ENABLE and PERF_ENABLE):
+        return
+    cands = []
+    for mint, pair in pairs.items():
+        mc = float(pair.get("marketCap") or pair.get("fdv") or 0)
+        price = float(pair.get("priceUsd") or 0)
+        if mc < DOUBLEDIP_MC_MIN or price <= 0:
+            continue
+        if not passes_filters(pair) and not passes_shadow_filters(pair):
+            continue  # 유동성/거래량 기본 품질 기준은 유지 (나이만 무관)
+        cands.append((mint, pair, price))
+    if not cands:
+        return
+
+    raws = r_pipe([["GET", f"doubledip:{m}"] for m, _, _ in cands])
+    now = time.time()
+    writes = []
+    for (mint, pair, price), raw in zip(cands, raws):
+        sym = (pair.get("baseToken") or {}).get("symbol", "?")
+        try:
+            st = json.loads(raw) if raw else None
+        except Exception:
+            st = None
+
+        if st is None:
+            # 최초 관찰: 고점 추적 시작
+            writes.append(["SETEX", f"doubledip:{mint}", DOUBLEDIP_STATE_TTL,
+                           json.dumps({"stage": 0, "swing_high": price, "bounce_high": None, "d1_ts": None})])
+            continue
+
+        stage = st.get("stage", 0)
+
+        if stage == 0:
+            swing_high = st.get("swing_high", price)
+            if price > swing_high:
+                st["swing_high"] = price
+            else:
+                drop = (swing_high - price) / swing_high * 100
+                if drop >= DOUBLEDIP_D1_PCT:
+                    # 1차 눌림 확정 → stage 1 (반등 대기)
+                    st = {"stage": 1, "swing_high": swing_high, "bounce_high": price, "d1_ts": now}
+            writes.append(["SETEX", f"doubledip:{mint}", DOUBLEDIP_STATE_TTL, json.dumps(st)])
+            continue
+
+        if stage == 1:
+            # 시간 초과면 리셋 (1차→2차 윈도우 밖)
+            if now - (st.get("d1_ts") or 0) > DOUBLEDIP_WINDOW_S:
+                writes.append(["SETEX", f"doubledip:{mint}", DOUBLEDIP_STATE_TTL,
+                               json.dumps({"stage": 0, "swing_high": price, "bounce_high": None, "d1_ts": None})])
+                continue
+            bounce_high = st.get("bounce_high", price)
+            if price > bounce_high:
+                # 반등 고점 계속 갱신
+                st["bounce_high"] = price
+                writes.append(["SETEX", f"doubledip:{mint}", DOUBLEDIP_STATE_TTL, json.dumps(st)])
+                continue
+            drop2 = (bounce_high - price) / bounce_high * 100
+            if drop2 >= DOUBLEDIP_D2_PCT:
+                # ★ 2단 눌림 확정 — 알림 없이 관찰 등록만
+                perf_add(mint, sym, "doubledip", price)
+                print(f"[DOUBLEDIP] {sym} 2단눌림 확정 (1차 -{DOUBLEDIP_D1_PCT}%→반등→2차 -{drop2:.0f}%) 관찰등록, 알림없음")
+                writes.append(["DEL", f"doubledip:{mint}"])  # 확정 후 상태 종료(재확정 방지)
+            else:
+                writes.append(["SETEX", f"doubledip:{mint}", DOUBLEDIP_STATE_TTL, json.dumps(st)])
+
+    if writes:
+        r_pipe(writes)
+
+
 # ============================================================
 # 눌림목(DIP) 감지
 # ============================================================
@@ -1565,6 +1656,7 @@ def main():
             if cycle % 3 == 0:
                 perf_tick(pairs)
                 shadow_tick(pairs)
+                doubledip_tick(pairs)
 
         except Exception:
             print(f"[cycle {cycle}] fatal:\n{traceback.format_exc()}")

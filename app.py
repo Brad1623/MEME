@@ -33,6 +33,7 @@ def r_status():
         cmds.append(["GET", "pos:snapshot"])
         cmds.append(["GET", "perf:summary"])
         cmds.append(["GET", "perf:summary_shadow"])
+        cmds.append(["GET", "perf:summary_doubledip"])
         cmds.append(["GET", "mkt:activity"])
         cmds.append(["GET", "trades:summary"])
         cmds.append(["LRANGE", "trades:done", 0, 4])
@@ -50,14 +51,15 @@ def r_status():
         d["possnap"] = vals[8] if len(vals) > 8 else None
         d["perfsum"] = vals[9] if len(vals) > 9 else None
         d["shadowsum"] = vals[10] if len(vals) > 10 else None
-        d["mktact"] = vals[11] if len(vals) > 11 else None
-        d["tradesum"] = vals[12] if len(vals) > 12 else None
-        d["trades"] = vals[13] if len(vals) > 13 and vals[13] else []
+        d["ddsum"] = vals[11] if len(vals) > 11 else None
+        d["mktact"] = vals[12] if len(vals) > 12 else None
+        d["tradesum"] = vals[13] if len(vals) > 13 else None
+        d["trades"] = vals[14] if len(vals) > 14 and vals[14] else []
         return d
     except Exception:
         return {k: None for k in get_keys} | {"history": [], "archive": [], "possnap": None,
-                                              "perfsum": None, "shadowsum": None, "mktact": None,
-                                              "tradesum": None, "trades": []}
+                                              "perfsum": None, "shadowsum": None, "ddsum": None,
+                                              "mktact": None, "tradesum": None, "trades": []}
 
 
 def _spawn_worker():
@@ -287,6 +289,34 @@ def status():
         shadow_block = (f"<div class='row'><span class='k'>🔬 섀도우추적(20분미만):</span> 수집 중 "
                         f"<span style='color:#aaa;font-size:0.8em'>(나이필터 근거 검증용, 알림 없음)</span></div>")
 
+    # 🌀 2단 눌림(더블딥) 관찰 트래커 — 알림 없이 가설 검증 전용
+    dd_block = ""
+    try:
+        dds = json.loads(d.get("ddsum") or "{}")
+    except Exception:
+        dds = {}
+    if dds.get("n"):
+        def fmt3(v):
+            return f"{v:+.1f}%" if v is not None else "-"
+        diff2 = None
+        if ps.get("hit10_pct") is not None:
+            diff2 = dds.get("hit10_pct", 0) - ps.get("hit10_pct", 0)
+        diff2_txt = ""
+        if diff2 is not None:
+            dc2 = "#2ecc71" if diff2 > 5 else ("#e74c3c" if diff2 < -5 else "#888")
+            diff2_txt = f" <span style='color:{dc2}'>(정식알림 대비 {diff2:+.0f}%p)</span>"
+        dd_block = (
+            f"<div class='chart'><div class='k' style='font-size:0.9em;margin-bottom:8px'>"
+            f"🌀 2단눌림 관찰 (완료 {dds['n']}건 · 알림無 · 1차-10%→반등→2차-30% 가설검증)</div>"
+            f"<div style='font-size:1.05em;margin-bottom:6px'>+10% 도달률: <b>{dds.get('hit10_pct','?')}%</b>{diff2_txt}</div>"
+            f"<div style='font-size:0.88em;color:#555'>"
+            f"평균 최고점 {fmt3(dds.get('avg_peak'))} · 최악낙폭 {fmt3(dds.get('worst'))}</div>"
+            f"<div class='k' style='font-size:0.75em;margin-top:6px'>표본 20건+ 쌓이면 판단 · 검증되면 정식 알림 승격 검토</div></div>"
+        )
+    else:
+        dd_block = (f"<div class='row'><span class='k'>🌀 2단눌림 관찰:</span> 수집 중 "
+                    f"<span style='color:#aaa;font-size:0.8em'>(가설검증용, 알림 없음)</span></div>")
+
     # 🌐 시장 활성도 (거래량 신호 보정 지수)
     try:
         mact = float(d.get("mktact")) if d.get("mktact") else None
@@ -362,6 +392,7 @@ def status():
 {pos_block}
 {perf_block}
 {shadow_block}
+{dd_block}
 {trade_block}
 {arch_block}
 <p style='color:#aaa;font-size:0.85em;margin-top:30px'>30초마다 자동 새로고침 · 사이클 숫자가 계속 올라가면 정상</p>
@@ -417,6 +448,12 @@ def status():
 <div style='font-weight:bold;margin:14px 0 6px'>⏱ 나이 필터 (20분 미만 제외 — 검증 진행중)</div>
 <div style='color:#555'>정식 알림은 상장 20분+ 코인만. 20분 미만은 <b>알림 없이 섀도우 추적</b>만 하여 이 기준이 실제로 유효한지 데이터로 검증 중(위 🔬 섀도우추적 항목).</div>
 
+<div style='font-weight:bold;margin:14px 0 6px'>🌀 2단눌림 가설 (2026-07-21 관찰 시작)</div>
+<div style='color:#555'>
+대상: 시총 $500K+ (전문가 스위트스팟 하한)<br>
+① 고점 대비 -10% 이내 1차 눌림 → ② 반등 → ③ 반등고점 대비 -30% 2차 눌림 (①→③ 1시간 이내)<br>
+가설: 이 2차 눌림 시점이 좋은 진입점 — <b>아직 미검증, 알림 없이 forward-test 중</b>(위 🌀 항목)</div>
+
 <div style='font-weight:bold;margin:14px 0 6px'>🔻 매도 위험도 (포지션 감시 · 100점 만점)</div>
 <table style='width:100%;border-collapse:collapse'>
 <tr style='color:#888;font-size:0.9em'><td>신호</td><td style='text-align:right'>최대</td><td style='text-align:right'>발동 조건</td></tr>
@@ -454,6 +491,7 @@ def export():
             ["LRANGE", "trades:done", 0, 99],
             ["GET", "perf:summary"],
             ["GET", "perf:summary_shadow"],
+            ["GET", "perf:summary_doubledip"],
         ]
         resp = requests.post(
             screener.UPSTASH_URL + "/pipeline",
@@ -467,6 +505,7 @@ def export():
             "trades": vals[2] or [],
             "perf_summary": vals[3],
             "perf_summary_shadow": vals[4],
+            "perf_summary_doubledip": vals[5],
         }, 200
     except Exception as e:
         return {"error": str(e)}, 500
