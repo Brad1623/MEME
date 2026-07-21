@@ -255,7 +255,9 @@ def status():
             f"<b style='color:{hit_c}'>{ps.get('hit10_pct','?')}%</b></div>"
             f"<div style='font-size:0.88em;color:#555'>"
             f"중앙값 수익 — 1h {fmt(ps.get('med_r1'))} · 6h {fmt(ps.get('med_r6'))} · 24h {fmt(ps.get('med_r24'))}<br>"
-            f"평균 최고점 {fmt(ps.get('avg_peak'))} · 최악 낙폭 {fmt(ps.get('worst'))}</div></div>"
+            f"평균 최고점 {fmt(ps.get('avg_peak'))} · 최악 낙폭 {fmt(ps.get('worst'))}</div>"
+            f"<div class='k' style='font-size:0.75em;margin-top:6px'>"
+            f"조기종료(-80%↓) {ps.get('early_pct','?')}% · Upstash 절감용, 24h까지 안 기다림</div></div>"
         )
     else:
         perf_block = (f"<div class='row'><span class='k'>📈 성과추적:</span> 수집 중 "

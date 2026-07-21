@@ -373,9 +373,13 @@ def perf_add(mint, sym, kind, price):
     r_cmd("SADD", "perf:index", key)
 
 
+DEEP_CRASH_EXIT_PCT = -80.0   # 이 낙폭 이하로 빠지면 조기종료 (24h까지 안 기다림 — 대부분 이 밑에서 안 살아남음)
+DEEP_CRASH_MIN_AGE_S = 1800   # 초반 변동성 노이즈 방지: 최소 30분 지난 뒤부터 조기종료 판정
+
+
 def perf_tick(pairs):
     """추적중 코인 갱신: 최고/최저 업데이트, 1h/6h/24h 수익률 확정, 완료 시 집계.
-    ★ Redis 절감: 개별 GET/SET을 파이프라인으로 일괄 처리."""
+    ★ Redis 절감: 개별 GET/SET을 파이프라인으로 일괄 처리 + 깊은 붕괴 조기종료로 추적기간 단축."""
     if not PERF_ENABLE:
         return
     keys = r_cmd("SMEMBERS", "perf:index") or []
@@ -400,20 +404,28 @@ def perf_tick(pairs):
             cleanups.append(["SREM", "perf:index", k])
             continue
         pair = pairs.get(it["mint"])
+        age = now - it["ts"]
         if pair:
             price = float(pair.get("priceUsd") or 0)
             if price > 0 and it["ap"] > 0:
                 pnl = (price - it["ap"]) / it["ap"] * 100
                 it["peak"] = round(max(it["peak"], pnl), 1)
                 it["trough"] = round(min(it["trough"], pnl), 1)
-                age = now - it["ts"]
                 if it["r1"] is None and age >= 3600:
                     it["r1"] = round(pnl, 1)
                 if it["r6"] is None and age >= 21600:
                     it["r6"] = round(pnl, 1)
                 if it["r24"] is None and age >= 86400:
                     it["r24"] = round(pnl, 1)
-        if it["r24"] is not None or (now - it["ts"]) > 90000:
+
+        # 조기종료: 30분 지나고 -80% 이하로 빠지면 24h 안 기다리고 바로 종료
+        # (Upstash 부담 절감 — 이 낙폭에서 반등해 살아나는 경우는 극히 드묾)
+        deep_crash = (age >= DEEP_CRASH_MIN_AGE_S and it["trough"] <= DEEP_CRASH_EXIT_PCT)
+        if deep_crash and it["r24"] is None:
+            it["r24"] = it["trough"]     # 사실상 바닥이므로 trough를 r24 대용으로 기록
+            it["early_exit"] = "deep_crash"
+
+        if it["r24"] is not None or age > 90000:
             done_push.append(["LPUSH", "perf:done", json.dumps(it)])
             cleanups.append(["SREM", "perf:index", k])
             cleanups.append(["DEL", k])
@@ -452,6 +464,7 @@ def _perf_summarize():
                 return None
             n = len(subset)
             hit10 = sum(1 for i in subset if i.get("peak", 0) >= 10)
+            early = sum(1 for i in subset if i.get("early_exit") == "deep_crash")
             return {
                 "n": n,
                 "hit10_pct": round(hit10 / n * 100),
@@ -460,6 +473,7 @@ def _perf_summarize():
                 "med_r24": med([i.get("r24") for i in subset]),
                 "avg_peak": round(sum(i.get("peak", 0) for i in subset) / n, 1),
                 "worst": round(min(i.get("trough", 0) for i in subset), 1),
+                "early_pct": round(early / n * 100),
             }
 
         alert_items = [i for i in items if i.get("kind") in ("pump", "dip")]
