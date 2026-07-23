@@ -411,7 +411,6 @@ def status():
 <tr><td>매수 압력</td><td style='text-align:right'><b>15</b></td><td style='text-align:right;color:#888'>매수비율 100%</td></tr>
 <tr><td>5분 모멘텀</td><td style='text-align:right'><b>10</b></td><td style='text-align:right;color:#888'>5m +10%</td></tr>
 <tr><td>EMA 골든크로스</td><td style='text-align:right'><b>10</b></td><td style='text-align:right;color:#888'>방금 교차(정배열 5)</td></tr>
-<tr><td>레딧 언급증가</td><td style='text-align:right'><b>10</b></td><td style='text-align:right;color:#888'>시간당 +3건</td></tr>
 <tr><td>부스트</td><td style='text-align:right'><b>5</b></td><td style='text-align:right;color:#888'>유료홍보중</td></tr>
 <tr><td>신규상장</td><td style='text-align:right'><b>5</b></td><td style='text-align:right;color:#888'>48h 이내</td></tr>
 </table>
@@ -431,7 +430,6 @@ def status():
 <tr><td>🚫 초집중 ⚠️</td><td style='text-align:right;color:#888'>≥50% 사기수준</td></tr>
 <tr><td>⚠️ 봇펌핑의심</td><td style='text-align:right;color:#888'>20분내 +100%</td></tr>
 <tr><td>🏆 검증된코인</td><td style='text-align:right;color:#888'>7일+ 생존(눌림목)</td></tr>
-<tr><td>💬 커뮤니티활성</td><td style='text-align:right;color:#888'>레딧 언급(눌림목)</td></tr>
 </table>
 
 <div style='font-weight:bold;margin:14px 0 6px'>💡 인사이트</div>

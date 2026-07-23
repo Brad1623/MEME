@@ -8,7 +8,6 @@ Solana Memecoin Momentum Screener v1.0
   - DexScreener API  : 거래량/가격/매수매도/유동성/부스트
   - GeckoTerminal API: 트렌딩 풀, 신규 풀, 5분봉 OHLCV (EMA 크로스)
   - RugCheck API     : 러그풀 위험 필터 (danger 플래그 자동 제외)
-  - Reddit public JSON: 서브레딧 언급량 증가 감지
 
 인프라: Render Background Worker + Upstash Redis (REST) + Telegram Bot
 """
@@ -37,7 +36,6 @@ MAX_AGE_DAYS   = int(os.getenv("MAX_AGE_DAYS", "30"))             # 30일 이상
 ALERT_SCORE    = float(os.getenv("ALERT_SCORE", "65"))            # 알림 발송 최소 점수 (0~100)
 COOLDOWN_SEC   = int(os.getenv("ALERT_COOLDOWN_SEC", "7200"))     # 동일 코인 재알림 쿨다운 2시간(밈코인 특성상 6h는 과함)
 LOOP_SEC       = int(os.getenv("LOOP_SECONDS", "120"))            # 스캔 주기 2분
-REDDIT_CYCLES  = int(os.getenv("REDDIT_EVERY_CYCLES", "5"))       # 레딧은 N사이클마다 (rate limit 보호)
 OHLCV_TOP_N    = int(os.getenv("OHLCV_TOP_N", "8"))               # EMA 계산은 상위 N개만 (API 절약)
 
 # --- 눌림목(DIP) 감지 설정 ---
@@ -51,10 +49,9 @@ DIP_BUY_RATIO  = float(os.getenv("DIP_BUY_RATIO", "0.55"))        # 눌리는 �
 DIP_MAX_FADE   = float(os.getenv("DIP_MAX_FADE", "0.5"))          # 추세붕괴 방지: 현재h1 < 등록시점*0.5면 제외
 DIP_COOLDOWN   = int(os.getenv("DIP_COOLDOWN_SEC", "3600"))       # dip 재알림 쿨다운 1시간
 
-# --- 눌림목 강화: 오래된 코인 우대(A) + 레딧 체크(B) ---
+# --- 눌림목 강화: 오래된 코인 우대(A) (레딧 언급 체크는 Reddit API 정책변경으로 2026-07-22 제거) ---
 DIP_VETERAN_DAYS = float(os.getenv("DIP_VETERAN_DAYS", "7"))       # 이 일수 이상 = '검증된' 오래된 코인
 DIP_VETERAN_EASE = float(os.getenv("DIP_VETERAN_EASE", "0.8"))     # 오래된 코인은 거래량/매수 기준을 이 비율로 완화
-DIP_REDDIT_CHECK = os.getenv("DIP_REDDIT_CHECK", "1") == "1"       # 눌림목 레딧 언급 체크 on/off
 
 # --- 매도 시그널 (포지션 감시) — 가중치 점수제 ---
 SELL_SCORE     = float(os.getenv("SELL_SCORE", "40"))              # 위험도 이 점수 이상이면 알림 (0~100)
@@ -106,7 +103,6 @@ TAG_BOT_AGE_MIN  = float(os.getenv("TAG_BOT_AGE_MIN", "20"))      # 20분 미만
 TAG_BOT_PUMP_H1  = float(os.getenv("TAG_BOT_PUMP_H1", "100"))     # 1h +100%+ 면 봇 의심
 
 UA = {"User-Agent": "Mozilla/5.0 (sol-meme-screener/1.0)"}
-SUBREDDITS = ["CryptoMoonShots", "solana", "memecoins", "SolanaMemeCoins"]
 
 DEXS_BASE  = "https://api.dexscreener.com"
 GECKO_BASE = "https://api.geckoterminal.com/api/v2"
@@ -923,45 +919,9 @@ def rugcheck(mint):
 
 
 # ============================================================
-# Reddit 언급량
-# ============================================================
-def scan_reddit(symbols):
-    """서브레딧 신규글에서 '$SYMBOL' 패턴 언급 횟수 집계 → Redis 시간버킷 저장.
-    반환: {symbol: (이번시간 카운트, 직전시간 카운트)}"""
-    counts = {s: 0 for s in symbols}
-    for sub in SUBREDDITS:
-        try:
-            r = requests.get(
-                f"https://www.reddit.com/r/{sub}/new.json?limit=100",
-                headers=UA, timeout=15,
-            )
-            if r.status_code != 200:
-                continue
-            for post in r.json()["data"]["children"]:
-                d = post["data"]
-                text = f"{d.get('title','')} {d.get('selftext','')}".upper()
-                for sym in symbols:
-                    # '$SYM' 정확 매칭만 (SOL 같은 짧은 심볼 오탐 방지)
-                    if f"${sym.upper()}" in text:
-                        counts[sym] += 1
-        except Exception as e:
-            print(f"[reddit] r/{sub} error: {e}")
-        time.sleep(1)
-
-    hour_now = int(time.time() // 3600)
-    result = {}
-    for sym, c in counts.items():
-        if c > 0:
-            r_cmd("SETEX", f"reddit:{sym}:{hour_now}", 7200, c)
-        prev = r_cmd("GET", f"reddit:{sym}:{hour_now - 1}")
-        result[sym] = (c, int(prev) if prev else 0)
-    return result
-
-
-# ============================================================
 # 스코어링 (0~100)
 # ============================================================
-def score_pair(pair, boosted, ema_flag=None, reddit_delta=0):
+def score_pair(pair, boosted, ema_flag=None):
     s = 0.0
     reasons = []
 
@@ -1013,11 +973,6 @@ def score_pair(pair, boosted, ema_flag=None, reddit_delta=0):
         reasons.append("5분봉 EMA9/21 골든크로스")
     elif ema_flag == "above":
         s += 5
-
-    # 7) 레딧 언급 증가 (최대 10점)
-    if reddit_delta > 0:
-        s += min(10, reddit_delta * 3)
-        reasons.append(f"레딧 언급 +{reddit_delta}건/h 증가")
 
     return round(s, 1), reasons
 
@@ -1107,16 +1062,19 @@ def doubledip_tick(pairs):
             continue
 
         stage = st.get("stage", 0)
+        # 스냅샷 사이(2분)의 움직임 보정: DexScreener m5(5분 변동률)가 이미 하락을 보여주면
+        # 그 하락 직전 가격을 역산해 '샘플 사이에 찍힌 고점'으로 간주 (샘플링 누락 방지)
+        m5 = float((pair.get("priceChange") or {}).get("m5") or 0)
+        implied_high = price / (1 + m5 / 100) if m5 < 0 and m5 > -95 else price
 
         if stage == 0:
-            swing_high = st.get("swing_high", price)
-            if price > swing_high:
-                st["swing_high"] = price
+            swing_high = max(st.get("swing_high", price), price, implied_high)
+            drop = (swing_high - price) / swing_high * 100 if swing_high > 0 else 0
+            if drop >= DOUBLEDIP_D1_PCT:
+                # 1차 눌림 확정 → stage 1 (반등 대기)
+                st = {"stage": 1, "swing_high": swing_high, "bounce_high": price, "d1_ts": now}
             else:
-                drop = (swing_high - price) / swing_high * 100
-                if drop >= DOUBLEDIP_D1_PCT:
-                    # 1차 눌림 확정 → stage 1 (반등 대기)
-                    st = {"stage": 1, "swing_high": swing_high, "bounce_high": price, "d1_ts": now}
+                st["swing_high"] = swing_high
             writes.append(["SETEX", f"doubledip:{mint}", DOUBLEDIP_STATE_TTL, json.dumps(st)])
             continue
 
@@ -1126,19 +1084,16 @@ def doubledip_tick(pairs):
                 writes.append(["SETEX", f"doubledip:{mint}", DOUBLEDIP_STATE_TTL,
                                json.dumps({"stage": 0, "swing_high": price, "bounce_high": None, "d1_ts": None})])
                 continue
-            bounce_high = st.get("bounce_high", price)
-            if price > bounce_high:
-                # 반등 고점 계속 갱신
-                st["bounce_high"] = price
-                writes.append(["SETEX", f"doubledip:{mint}", DOUBLEDIP_STATE_TTL, json.dumps(st)])
-                continue
-            drop2 = (bounce_high - price) / bounce_high * 100
+            # 반등 고점 갱신과 낙폭 판정을 '동시에' 수행 (기존엔 배타적이라 놓침)
+            bounce_high = max(st.get("bounce_high") or price, price, implied_high)
+            drop2 = (bounce_high - price) / bounce_high * 100 if bounce_high > 0 else 0
             if drop2 >= DOUBLEDIP_D2_PCT:
                 # ★ 2단 눌림 확정 — 알림 없이 관찰 등록만
                 perf_add(mint, sym, "doubledip", price)
                 print(f"[DOUBLEDIP] {sym} 2단눌림 확정 (1차 -{DOUBLEDIP_D1_PCT}%→반등→2차 -{drop2:.0f}%) 관찰등록, 알림없음")
                 writes.append(["DEL", f"doubledip:{mint}"])  # 확정 후 상태 종료(재확정 방지)
             else:
+                st["bounce_high"] = bounce_high
                 writes.append(["SETEX", f"doubledip:{mint}", DOUBLEDIP_STATE_TTL, json.dumps(st)])
 
     if writes:
@@ -1510,7 +1465,7 @@ def main():
         tg_send(
             "🤖 <b>Solana Meme Screener v1.0 가동</b>\n"
             f"스캔주기 {LOOP_SEC}s · 알림점수 ≥{ALERT_SCORE} · 최소유동성 {fmt_usd(MIN_LIQ_USD)}\n"
-            "소스: DexScreener + GeckoTerminal + RugCheck + Reddit"
+            "소스: DexScreener + GeckoTerminal + RugCheck"
         )
         r_cmd("SETEX", "boot_notified", 86400, "1")  # 24시간 후 만료
 
@@ -1521,7 +1476,6 @@ def main():
         _POLLER_STARTED = True
 
     cycle = 0
-    reddit_cache = {}  # {symbol: delta}
 
     while True:
         cycle += 1
@@ -1530,25 +1484,31 @@ def main():
             n = len(mints)
             print(f"[cycle {cycle}] candidates: {n} (trend {src['gecko_trend']} / new {src['gecko_new']} / boost {src['dex_boost']})")
 
-            # 포지션·성과추적 코인은 트렌딩에서 빠져도 항상 시세 확보 (감시 필수)
-            for pm in (r_cmd("SMEMBERS", "pos:index") or []):
-                mints.add(pm)
+            # 포지션·성과추적·눌림목추적 코인은 트렌딩에서 빠져도 항상 시세 확보 (감시 필수)
+            # ★ Redis 절감: 개별 SMEMBERS 2~3회 → 파이프라인 1회
+            idx_cmds = [["SMEMBERS", "pos:index"]]
             if PERF_ENABLE:
-                for pk in (r_cmd("SMEMBERS", "perf:index") or []):
+                idx_cmds.append(["SMEMBERS", "perf:index"])
+            if DIP_ENABLE:
+                idx_cmds.append(["KEYS", "dip_track:*"])
+            idx_res = r_pipe(idx_cmds)
+            for pm in (idx_res[0] or []):
+                mints.add(pm)
+            ri = 1
+            if PERF_ENABLE:
+                for pk in (idx_res[ri] or []):
                     seg = pk.split(":")
                     if len(seg) >= 3:
                         mints.add(seg[2])
+                ri += 1
+            if DIP_ENABLE:
+                # dip_track:{mint} → mint 추출. 추적중인 코인이 트렌딩에서 빠져도
+                # 시세를 확보해야 눌림목 감시가 끊기지 않음 (눌림목 0건 원인 대응)
+                for dk in (idx_res[ri] or []):
+                    if ":" in dk:
+                        mints.add(dk.split(":", 1)[1])
 
             pairs = fetch_pairs(mints)
-
-            # 상태 기록 (브라우저 /status 로 확인용)
-            r_cmd("SET", "status:cycle", cycle)
-            r_cmd("SET", "status:candidates", n)
-            r_cmd("SET", "status:last_scan", int(time.time()))
-            # 흐름 이력: "후보수:trend:new:boost" 를 리스트 앞에 넣고 최근 20개만 유지
-            hist = f"{n}:{src['gecko_trend']}:{src['gecko_new']}:{src['dex_boost']}"
-            r_cmd("LPUSH", "status:history", hist)
-            r_cmd("LTRIM", "status:history", 0, 19)
 
             # 1차 필터 + 기본 점수
             scored = []
@@ -1562,33 +1522,35 @@ def main():
             # ★ 쿨다운 걸린 코인을 '슬롯 자르기 전에' 미리 제거 (핵심 수정)
             # 안 그러면 쿨다운 걸린 상위 코인들이 정밀검사 슬롯(OHLCV_TOP_N)을
             # 다 차지해서, 그 아래의 새 급등 코인이 검사조차 못 받음.
+            # ★ Redis 절감: 후보 N개 개별 GET → 파이프라인 1회
+            cd_flags = r_pipe([["GET", f"alerted:{m}"] for _, m, _ in scored]) if scored else []
             fresh = []
             skipped_cd = 0
-            for item in scored:
-                if r_cmd("GET", f"alerted:{item[1]}"):
+            for item, flag in zip(scored, cd_flags):
+                if flag:
                     skipped_cd += 1
                     continue
                 fresh.append(item)
             if skipped_cd:
                 print(f"[cycle {cycle}] 쿨다운 스킵 {skipped_cd}개 → 새 후보 {len(fresh)}개 정밀검사 대상")
-            r_cmd("SET", "status:cooldown_skip", skipped_cd)
-            r_cmd("SET", "status:fresh_count", len(fresh))
 
-            # 레딧 스캔 (N사이클마다, 상위 '새' 후보 심볼만)
-            if cycle % REDDIT_CYCLES == 1 and fresh:
-                syms = list({
-                    (p.get("baseToken") or {}).get("symbol", "")
-                    for _, _, p in fresh[:20]
-                } - {""})
-                rd = scan_reddit(syms)
-                reddit_cache = {s: max(0, cur - prev) for s, (cur, prev) in rd.items()}
+            # 상태 기록도 파이프라인 1회로 통합 (기존 개별 SET/LPUSH/LTRIM 5회)
+            hist = f"{n}:{src['gecko_trend']}:{src['gecko_new']}:{src['dex_boost']}"
+            r_pipe([
+                ["SET", "status:cycle", cycle],
+                ["SET", "status:candidates", n],
+                ["SET", "status:last_scan", int(time.time())],
+                ["LPUSH", "status:history", hist],
+                ["LTRIM", "status:history", 0, 19],
+                ["SET", "status:cooldown_skip", skipped_cd],
+                ["SET", "status:fresh_count", len(fresh)],
+            ])
 
             # 쿨다운 제거된 새 후보 중 상위만 EMA + RugCheck 정밀 검사
             for base_score, mint, pair in fresh[:OHLCV_TOP_N]:
                 sym = (pair.get("baseToken") or {}).get("symbol", "")
                 ema_flag = ema_signal(pair.get("pairAddress", ""))
-                rdelta = reddit_cache.get(sym, 0)
-                final_score, reasons = score_pair(pair, boosted, ema_flag, rdelta)
+                final_score, reasons = score_pair(pair, boosted, ema_flag)
 
                 if final_score < ALERT_SCORE:
                     continue
@@ -1638,11 +1600,6 @@ def main():
                     if not is_dip:
                         continue
                     sym = (pair.get("baseToken") or {}).get("symbol", "")
-                    # B: 눌림목 레딧 언급 체크 — 언급 살아있으면 커뮤니티 활성 표시
-                    if DIP_REDDIT_CHECK:
-                        rmention = reddit_cache.get(sym, 0)
-                        if rmention > 0:
-                            dip_reasons.append(f"💬 커뮤니티 활성 (레딧 +{rmention}건)")
                     dangers, warns, top_pct = rugcheck(mint)
                     if dangers:
                         r_cmd("SETEX", f"dip_alerted:{mint}", DIP_COOLDOWN, "rug")
@@ -1667,10 +1624,12 @@ def main():
             activity = market_activity(pairs)
             positions_tick(pairs, activity)
             # 성과추적/섀도우는 3사이클(약 6분)마다 — 가격 추적엔 충분, Redis 절감
+            # 2단눌림은 매 사이클(2분) — 6분 간격이면 눌림/반등을 통째로 놓침
+            doubledip_tick(pairs)
+            # 성과추적/섀도우는 3사이클(6분)마다 — 가격 추적엔 충분, Redis 절감
             if cycle % 3 == 0:
                 perf_tick(pairs)
                 shadow_tick(pairs)
-                doubledip_tick(pairs)
 
         except Exception:
             print(f"[cycle {cycle}] fatal:\n{traceback.format_exc()}")
