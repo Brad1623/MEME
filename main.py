@@ -508,9 +508,10 @@ def handle_command(text):
         if len(parts) < 2:
             return "사용법: /buy 민트주소 [진입가] [손절%]"
         mint = parts[1]
-        pair = fetch_pairs([mint]).get(mint)
+        pair = fetch_one_pair(mint)
         if not pair:
-            return "❌ 코인 조회 실패 — 민트주소를 확인해줘"
+            return ("❌ 조회 실패 (DexScreener 응답 없음)\n"
+                    "3회 재시도했어. 잠시 후 다시 누르거나, 민트주소를 확인해줘.")
         price = float(pair.get("priceUsd") or 0)
         if len(parts) >= 3:
             try:
@@ -539,7 +540,7 @@ def handle_command(text):
         if not raw:
             return "해당 민트의 포지션이 없어"
         pos = json.loads(raw)
-        pair = fetch_pairs([mint]).get(mint)
+        pair = fetch_one_pair(mint)
         pnl = None
         exit_price = None
         if pair:
@@ -607,9 +608,10 @@ def handle_command(text):
         if len(parts) < 2:
             return "사용법: /check 민트주소"
         mint = parts[1]
-        pair = fetch_pairs([mint]).get(mint)
+        pair = fetch_one_pair(mint)
         if not pair:
-            return "❌ 코인 조회 실패"
+            return ("❌ 조회 실패 (DexScreener 응답 없음)\n"
+                    "3회 재시도했어. 잠시 후 다시 시도해줘.")
         raw = r_cmd("GET", f"pos:{mint}")
         entry = json.loads(raw).get("entry") if raw else None
         act_raw = r_cmd("GET", "mkt:activity")
@@ -821,8 +823,13 @@ def fetch_pairs(mints):
         try:
             r = requests.get(f"{DEXS_BASE}/latest/dex/tokens/{chunk}", headers=UA, timeout=20)
             if r.status_code != 200:
+                # 조용히 넘기지 말고 원인을 남긴다 (429 rate limit 등 진단용)
+                print(f"[dexscreener] HTTP {r.status_code} (요청 {len(mints[i:i+30])}개) {r.text[:120]}")
                 continue
-            for pair in (r.json().get("pairs") or []):
+            pairs_raw = r.json().get("pairs") or []
+            if not pairs_raw:
+                print(f"[dexscreener] 응답에 pairs 없음 (요청 {len(mints[i:i+30])}개)")
+            for pair in pairs_raw:
                 if pair.get("chainId") != "solana":
                     continue
                 mint = (pair.get("baseToken") or {}).get("address")
@@ -835,6 +842,31 @@ def fetch_pairs(mints):
             print(f"[dexscreener pairs] error: {e}")
         time.sleep(0.3)
     return best
+
+
+def fetch_one_pair(mint, retries=3):
+    """명령(/buy /sell /check)용 단건 조회 — 재시도 + 키 매칭 안전장치.
+    일시적 429/네트워크 오류로 실패하는 문제 대응."""
+    mint = (mint or "").strip()
+    for attempt in range(retries):
+        got = fetch_pairs([mint])
+        if got:
+            # 정확 키 매칭 우선, 실패 시 대소문자 무시 매칭, 그래도 없으면 단건이니 그것을 사용
+            if mint in got:
+                return got[mint]
+            low = {k.lower(): v for k, v in got.items()}
+            if mint.lower() in low:
+                print(f"[fetch_one] 키 대소문자 불일치 보정: {mint}")
+                return low[mint.lower()]
+            if len(got) == 1:
+                only = next(iter(got.values()))
+                print(f"[fetch_one] 키 불일치하나 단건이라 사용: 요청={mint} 응답={list(got)[0]}")
+                return only
+        if attempt < retries - 1:
+            print(f"[fetch_one] {mint} 조회 실패 — {attempt+1}/{retries} 재시도")
+            time.sleep(1.5 * (attempt + 1))
+    print(f"[fetch_one] {mint} 최종 조회 실패")
+    return None
 
 
 # ============================================================
