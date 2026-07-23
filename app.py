@@ -34,6 +34,7 @@ def r_status():
         cmds.append(["GET", "perf:summary"])
         cmds.append(["GET", "perf:summary_shadow"])
         cmds.append(["GET", "perf:summary_doubledip"])
+        cmds.append(["GET", "perf:summary_sustain"])
         cmds.append(["GET", "mkt:activity"])
         cmds.append(["GET", "trades:summary"])
         cmds.append(["LRANGE", "trades:done", 0, 4])
@@ -52,14 +53,16 @@ def r_status():
         d["perfsum"] = vals[9] if len(vals) > 9 else None
         d["shadowsum"] = vals[10] if len(vals) > 10 else None
         d["ddsum"] = vals[11] if len(vals) > 11 else None
-        d["mktact"] = vals[12] if len(vals) > 12 else None
-        d["tradesum"] = vals[13] if len(vals) > 13 else None
-        d["trades"] = vals[14] if len(vals) > 14 and vals[14] else []
+        d["susum"] = vals[12] if len(vals) > 12 else None
+        d["mktact"] = vals[13] if len(vals) > 13 else None
+        d["tradesum"] = vals[14] if len(vals) > 14 else None
+        d["trades"] = vals[15] if len(vals) > 15 and vals[15] else []
         return d
     except Exception:
         return {k: None for k in get_keys} | {"history": [], "archive": [], "possnap": None,
                                               "perfsum": None, "shadowsum": None, "ddsum": None,
-                                              "mktact": None, "tradesum": None, "trades": []}
+                                              "susum": None, "mktact": None, "tradesum": None,
+                                              "trades": []}
 
 
 def _spawn_worker():
@@ -319,6 +322,36 @@ def status():
         dd_block = (f"<div class='row'><span class='k'>🌀 2단눌림 관찰:</span> 수집 중 "
                     f"<span style='color:#aaa;font-size:0.8em'>(가설검증용, 알림 없음)</span></div>")
 
+    # 🌿 지속형 관찰 트래커 — 폭발형 급등과 대조군
+    su_block = ""
+    try:
+        sus = json.loads(d.get("susum") or "{}")
+    except Exception:
+        sus = {}
+    if sus.get("n"):
+        def fmt4(v):
+            return f"{v:+.1f}%" if v is not None else "-"
+        diff3 = None
+        if ps.get("hit10_pct") is not None:
+            diff3 = sus.get("hit10_pct", 0) - ps.get("hit10_pct", 0)
+        diff3_txt = ""
+        if diff3 is not None:
+            dc3 = "#2ecc71" if diff3 > 5 else ("#e74c3c" if diff3 < -5 else "#888")
+            diff3_txt = f" <span style='color:{dc3}'>(정식알림 대비 {diff3:+.0f}%p)</span>"
+        su_block = (
+            f"<div class='chart'><div class='k' style='font-size:0.9em;margin-bottom:8px'>"
+            f"🌿 지속형 관찰 (완료 {sus['n']}건 · 알림無 · 폭발형 대조군)</div>"
+            f"<div style='font-size:1.05em;margin-bottom:6px'>+10% 도달률: <b>{sus.get('hit10_pct','?')}%</b>{diff3_txt}</div>"
+            f"<div style='font-size:0.88em;color:#555'>"
+            f"중앙값 — 1h {fmt4(sus.get('med_r1'))} · 6h {fmt4(sus.get('med_r6'))} · 24h {fmt4(sus.get('med_r24'))}<br>"
+            f"평균 최고점 {fmt4(sus.get('avg_peak'))} · 최악낙폭 {fmt4(sus.get('worst'))}</div>"
+            f"<div class='k' style='font-size:0.75em;margin-top:6px'>"
+            f"시총1M+ · 6시간+ · 거래250건+ · 과열아님 · 1h -10~+50%</div></div>"
+        )
+    else:
+        su_block = (f"<div class='row'><span class='k'>🌿 지속형 관찰:</span> 수집 중 "
+                    f"<span style='color:#aaa;font-size:0.8em'>(폭발형 대조군, 알림 없음)</span></div>")
+
     # 🌐 시장 활성도 (거래량 신호 보정 지수)
     try:
         mact = float(d.get("mktact")) if d.get("mktact") else None
@@ -395,6 +428,7 @@ def status():
 {perf_block}
 {shadow_block}
 {dd_block}
+{su_block}
 {trade_block}
 {arch_block}
 <p style='color:#aaa;font-size:0.85em;margin-top:30px'>30초마다 자동 새로고침 · 사이클 숫자가 계속 올라가면 정상</p>
@@ -448,6 +482,12 @@ def status():
 <div style='font-weight:bold;margin:14px 0 6px'>⏱ 나이 필터 (20분 미만 제외 — 검증 진행중)</div>
 <div style='color:#555'>정식 알림은 상장 20분+ 코인만. 20분 미만은 <b>알림 없이 섀도우 추적</b>만 하여 이 기준이 실제로 유효한지 데이터로 검증 중(위 🔬 섀도우추적 항목).</div>
 
+<div style='font-weight:bold;margin:14px 0 6px'>🌿 지속형 가설 (2026-07-24 관찰 시작)</div>
+<div style='color:#555'>
+"러그도 메이저도 아닌데 흐름이 유지되는" 중간대 코인이 폭발형 급등보다 나을까?<br>
+조건: 시총 $1M+ · 나이 6시간+ · 1h거래 250건+ · 과열아님(거래량/유동성 5배↓) · 1h -10~+50% · 24h 0%+<br>
+<b>미검증, 알림 없이 forward-test 중</b> (위 🌿 항목) — 정식 알림(폭발형)과 도달률 비교</div>
+
 <div style='font-weight:bold;margin:14px 0 6px'>🌀 2단눌림 가설 (2026-07-21 관찰 시작)</div>
 <div style='color:#555'>
 대상: 시총 $500K+ (전문가 스위트스팟 하한)<br>
@@ -492,6 +532,7 @@ def export():
             ["GET", "perf:summary"],
             ["GET", "perf:summary_shadow"],
             ["GET", "perf:summary_doubledip"],
+            ["GET", "perf:summary_sustain"],
         ]
         resp = requests.post(
             screener.UPSTASH_URL + "/pipeline",
@@ -506,6 +547,7 @@ def export():
             "perf_summary": vals[3],
             "perf_summary_shadow": vals[4],
             "perf_summary_doubledip": vals[5],
+            "perf_summary_sustain": vals[6],
         }, 200
     except Exception as e:
         return {"error": str(e)}, 500

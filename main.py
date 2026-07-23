@@ -81,6 +81,19 @@ DOUBLEDIP_D2_PCT   = float(os.getenv("DOUBLEDIP_D2_PCT", "30"))      # 2차 눌�
 DOUBLEDIP_WINDOW_S = int(os.getenv("DOUBLEDIP_WINDOW_SEC", "3600"))  # 1차→2차 시간제한 1시간
 DOUBLEDIP_STATE_TTL = int(os.getenv("DOUBLEDIP_STATE_TTL_SEC", "7200"))  # 상태 보관 2시간(윈도우+여유)
 
+# --- 지속형(sustained) 관찰 트래커 (2026-07-24, 알림 없이 검증 전용) ---
+# 가설: '폭발형 급등'(우리 정식 알림)보다 "러그도 메이저도 아닌데 흐름이 유지되는" 코인이
+#       실제 생존율/수익이 나을 수 있다. 1차 자기교정에서 A등급만 r1이 플러스였던 것과 연결.
+SUSTAIN_ENABLE    = os.getenv("SUSTAIN_ENABLE", "1") == "1"
+SUSTAIN_MC_MIN    = float(os.getenv("SUSTAIN_MC_MIN", "1000000"))   # 시총 하한 $1M (스위트스팟 하단)
+SUSTAIN_AGE_MIN_H = float(os.getenv("SUSTAIN_AGE_MIN_H", "6"))      # 나이 6시간+ (초기 펌프 구간 통과)
+SUSTAIN_MIN_TXNS  = int(os.getenv("SUSTAIN_MIN_TXNS", "250"))       # 1h 거래 250건+ (관심 유지)
+SUSTAIN_MAX_HEAT  = float(os.getenv("SUSTAIN_MAX_HEAT", "5"))       # 과열 제외: 1h거래량/유동성 5배 미만
+SUSTAIN_H1_MIN    = float(os.getenv("SUSTAIN_H1_MIN", "-10"))       # 붕괴 아님
+SUSTAIN_H1_MAX    = float(os.getenv("SUSTAIN_H1_MAX", "50"))        # 폭발형 제외 (그건 정식 알림 영역)
+SUSTAIN_H24_MIN   = float(os.getenv("SUSTAIN_H24_MIN", "0"))        # 24h 기준 최소한 마이너스는 아님
+SUSTAIN_TTL       = int(os.getenv("SUSTAIN_TTL_SEC", "43200"))      # 동일코인 재등록 방지 12시간
+
 # --- 원클릭 매수 버튼 ---
 # 알림에 표시할 SOL 매수 금액 세트 (쉼표 구분). 누르면 Jupiter 스왑 페이지가 해당 금액으로 열림
 BUY_AMOUNTS = [a.strip() for a in os.getenv("BUY_AMOUNTS_SOL", "0.5,1,2").split(",") if a.strip()]
@@ -475,9 +488,11 @@ def _perf_summarize():
         alert_items = [i for i in items if i.get("kind") in ("pump", "dip")]
         shadow_items = [i for i in items if i.get("kind") == "shadow"]
         dd_items = [i for i in items if i.get("kind") == "doubledip"]
+        su_items = [i for i in items if i.get("kind") == "sustain"]
         s1 = summarize(alert_items)
         s2 = summarize(shadow_items)
         s3 = summarize(dd_items)
+        s4 = summarize(su_items)
         sets = []
         if s1:
             sets.append(["SET", "perf:summary", json.dumps(s1)])
@@ -485,6 +500,8 @@ def _perf_summarize():
             sets.append(["SET", "perf:summary_shadow", json.dumps(s2)])
         if s3:
             sets.append(["SET", "perf:summary_doubledip", json.dumps(s3)])
+        if s4:
+            sets.append(["SET", "perf:summary_sustain", json.dumps(s4)])
         if sets:
             r_pipe(sets)
 
@@ -511,7 +528,7 @@ def handle_command(text):
         pair = fetch_one_pair(mint)
         if not pair:
             return ("❌ 조회 실패 (DexScreener 응답 없음)\n"
-                    "3회 재시도했어. 잠시 후 다시 누르거나, 민트주소를 확인해줘.")
+                    "DexScreener rate limit(429)일 가능성이 높아. 30초쯤 뒤 다시 눌러줘.")
         price = float(pair.get("priceUsd") or 0)
         if len(parts) >= 3:
             try:
@@ -611,7 +628,7 @@ def handle_command(text):
         pair = fetch_one_pair(mint)
         if not pair:
             return ("❌ 조회 실패 (DexScreener 응답 없음)\n"
-                    "3회 재시도했어. 잠시 후 다시 시도해줘.")
+                    "DexScreener rate limit(429)일 가능성이 높아. 30초쯤 뒤 다시 시도해줘.")
         raw = r_cmd("GET", f"pos:{mint}")
         entry = json.loads(raw).get("entry") if raw else None
         act_raw = r_cmd("GET", "mkt:activity")
@@ -795,18 +812,20 @@ def collect_candidate_mints():
     # 2) DexScreener 부스트 (유료 홍보 중인 토큰 = 마케팅 자금 투입 신호)
     boosted = set()
     for path in ["/token-boosts/latest/v1", "/token-boosts/top/v1"]:
+        r = _dex_get(f"{DEXS_BASE}{path}", tries=2)
+        if r is None:
+            continue
         try:
-            r = requests.get(f"{DEXS_BASE}{path}", headers=UA, timeout=15)
-            if r.status_code == 200:
-                for item in r.json():
-                    if item.get("chainId") == "solana":
-                        addr = item.get("tokenAddress")
-                        if addr:
-                            mints.add(addr)
-                            boosted.add(addr)
-                            src["dex_boost"] += 1
+            for item in r.json():
+                if item.get("chainId") == "solana":
+                    addr = item.get("tokenAddress")
+                    if addr:
+                        mints.add(addr)
+                        boosted.add(addr)
+                        src["dex_boost"] += 1
         except Exception as e:
-            print(f"[dexscreener boosts] error: {e}")
+            print(f"[dexscreener boosts] parse error: {e}")
+        time.sleep(0.5)
 
     return mints, boosted, src
 
@@ -814,37 +833,66 @@ def collect_candidate_mints():
 # ============================================================
 # 데이터 소스: DexScreener 페어 상세
 # ============================================================
+def _dex_get(url, tries=3):
+    """DexScreener GET + 429 백오프 재시도.
+    Render 무료티어는 outbound IP를 공유해서 우리 요청량과 무관하게 429가 잦음."""
+    for attempt in range(tries):
+        try:
+            r = requests.get(url, headers=UA, timeout=20)
+            if r.status_code == 200:
+                return r
+            if r.status_code == 429:
+                # Retry-After 헤더 존중, 없으면 지수 백오프
+                try:
+                    wait = float(r.headers.get("Retry-After", 0))
+                except (ValueError, TypeError):
+                    wait = 0
+                if wait <= 0:
+                    wait = 2 * (2 ** attempt)      # 2s → 4s → 8s
+                if attempt < tries - 1:
+                    print(f"[dexscreener] 429 rate limit — {wait:.0f}s 대기 후 재시도 ({attempt+1}/{tries})")
+                    time.sleep(wait)
+                    continue
+                print(f"[dexscreener] 429 최종 실패 (공유IP 혼잡 추정)")
+                return None
+            print(f"[dexscreener] HTTP {r.status_code}")
+            return None
+        except Exception as e:
+            print(f"[dexscreener] error: {e}")
+            if attempt < tries - 1:
+                time.sleep(2 * (attempt + 1))
+    return None
+
+
 def fetch_pairs(mints):
     """mint 목록 → 각 토큰의 최대 유동성 솔라나 페어 반환 (30개씩 배치)."""
     best = {}
     mints = list(mints)
     for i in range(0, len(mints), 30):
         chunk = ",".join(mints[i : i + 30])
+        r = _dex_get(f"{DEXS_BASE}/latest/dex/tokens/{chunk}")
+        if r is None:
+            time.sleep(1.0)
+            continue
         try:
-            r = requests.get(f"{DEXS_BASE}/latest/dex/tokens/{chunk}", headers=UA, timeout=20)
-            if r.status_code != 200:
-                # 조용히 넘기지 말고 원인을 남긴다 (429 rate limit 등 진단용)
-                print(f"[dexscreener] HTTP {r.status_code} (요청 {len(mints[i:i+30])}개) {r.text[:120]}")
-                continue
             pairs_raw = r.json().get("pairs") or []
-            if not pairs_raw:
-                print(f"[dexscreener] 응답에 pairs 없음 (요청 {len(mints[i:i+30])}개)")
-            for pair in pairs_raw:
-                if pair.get("chainId") != "solana":
-                    continue
-                mint = (pair.get("baseToken") or {}).get("address")
-                if not mint:
-                    continue
-                liq = ((pair.get("liquidity") or {}).get("usd")) or 0
-                if mint not in best or liq > (((best[mint].get("liquidity") or {}).get("usd")) or 0):
-                    best[mint] = pair
         except Exception as e:
-            print(f"[dexscreener pairs] error: {e}")
-        time.sleep(0.3)
+            print(f"[dexscreener] JSON 파싱 실패: {e}")
+            pairs_raw = []
+        for pair in pairs_raw:
+            if pair.get("chainId") != "solana":
+                continue
+            mint = (pair.get("baseToken") or {}).get("address")
+            if not mint:
+                continue
+            liq = ((pair.get("liquidity") or {}).get("usd")) or 0
+            if mint not in best or liq > (((best[mint].get("liquidity") or {}).get("usd")) or 0):
+                best[mint] = pair
+        time.sleep(0.8)   # 배치 간 여유 (기존 0.3s → 429 완화)
     return best
 
 
-def fetch_one_pair(mint, retries=3):
+def fetch_one_pair(mint, retries=2):
     """명령(/buy /sell /check)용 단건 조회 — 재시도 + 키 매칭 안전장치.
     일시적 429/네트워크 오류로 실패하는 문제 대응."""
     mint = (mint or "").strip()
@@ -1128,6 +1176,60 @@ def doubledip_tick(pairs):
                 st["bounce_high"] = bounce_high
                 writes.append(["SETEX", f"doubledip:{mint}", DOUBLEDIP_STATE_TTL, json.dumps(st)])
 
+    if writes:
+        r_pipe(writes)
+
+
+def sustain_tick(pairs):
+    """지속형(sustained) 관찰 트래커 — 알림 없이 perf 등록만, 가설 검증용.
+    '폭발형 급등'과 반대 프로파일: 이미 초기 구간을 넘겼고, 과열되지 않았는데
+    거래가 꾸준하고 가격이 무너지지 않는 코인. 러그도 메이저도 아닌 중간대."""
+    if not (SUSTAIN_ENABLE and PERF_ENABLE):
+        return
+    cands = []
+    now_ms = time.time() * 1000
+    for mint, pair in pairs.items():
+        pc = pair.get("priceChange") or {}
+        vol = pair.get("volume") or {}
+        txns = (pair.get("txns") or {}).get("h1") or {}
+        price = float(pair.get("priceUsd") or 0)
+        mc = float(pair.get("marketCap") or pair.get("fdv") or 0)
+        liq = float((pair.get("liquidity") or {}).get("usd") or 0)
+        v1 = float(vol.get("h1") or 0)
+        h1 = float(pc.get("h1") or 0)
+        h24 = float(pc.get("h24") or 0)
+        created = pair.get("pairCreatedAt")
+        if price <= 0 or mc < SUSTAIN_MC_MIN or liq <= 0 or not created:
+            continue
+        # 나이: 초기 펌프 구간을 이미 통과했는가
+        if (now_ms - created) / 3600000 < SUSTAIN_AGE_MIN_H:
+            continue
+        # 거래 활발 (관심이 살아있는가)
+        if (int(txns.get("buys") or 0) + int(txns.get("sells") or 0)) < SUSTAIN_MIN_TXNS:
+            continue
+        # 과열 제외 (급락 리스크 구간은 지속형이 아님)
+        if v1 / liq >= SUSTAIN_MAX_HEAT:
+            continue
+        # 가격이 '무너지지도, 폭발하지도' 않은 구간
+        if not (SUSTAIN_H1_MIN <= h1 <= SUSTAIN_H1_MAX):
+            continue
+        if h24 < SUSTAIN_H24_MIN:
+            continue
+        cands.append((mint, pair, price))
+    if not cands:
+        return
+
+    # 중복 등록 방지 확인을 파이프라인 1회로
+    flags = r_pipe([["GET", f"sustained:{m}"] for m, _, _ in cands])
+    writes = []
+    for (mint, pair, price), flag in zip(cands, flags):
+        if flag:
+            continue
+        sym = (pair.get("baseToken") or {}).get("symbol", "?")
+        writes.append(["SETEX", f"sustained:{mint}", SUSTAIN_TTL, "1"])
+        perf_add(mint, sym, "sustain", price)
+        pc = pair.get("priceChange") or {}
+        print(f"[SUSTAIN] {sym} 지속형 관찰등록 (1h {pc.get('h1')}% · 24h {pc.get('h24')}%), 알림없음")
     if writes:
         r_pipe(writes)
 
@@ -1662,6 +1764,7 @@ def main():
             if cycle % 3 == 0:
                 perf_tick(pairs)
                 shadow_tick(pairs)
+                sustain_tick(pairs)
 
         except Exception:
             print(f"[cycle {cycle}] fatal:\n{traceback.format_exc()}")
