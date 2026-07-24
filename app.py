@@ -35,6 +35,7 @@ def r_status():
         cmds.append(["GET", "perf:summary_shadow"])
         cmds.append(["GET", "perf:summary_doubledip"])
         cmds.append(["GET", "perf:summary_sustain"])
+        cmds.append(["GET", "perf:summary_cgrade"])
         cmds.append(["GET", "mkt:activity"])
         cmds.append(["GET", "trades:summary"])
         cmds.append(["LRANGE", "trades:done", 0, 4])
@@ -54,15 +55,16 @@ def r_status():
         d["shadowsum"] = vals[10] if len(vals) > 10 else None
         d["ddsum"] = vals[11] if len(vals) > 11 else None
         d["susum"] = vals[12] if len(vals) > 12 else None
-        d["mktact"] = vals[13] if len(vals) > 13 else None
-        d["tradesum"] = vals[14] if len(vals) > 14 else None
-        d["trades"] = vals[15] if len(vals) > 15 and vals[15] else []
+        d["cgsum"] = vals[13] if len(vals) > 13 else None
+        d["mktact"] = vals[14] if len(vals) > 14 else None
+        d["tradesum"] = vals[15] if len(vals) > 15 else None
+        d["trades"] = vals[16] if len(vals) > 16 and vals[16] else []
         return d
     except Exception:
         return {k: None for k in get_keys} | {"history": [], "archive": [], "possnap": None,
                                               "perfsum": None, "shadowsum": None, "ddsum": None,
-                                              "susum": None, "mktact": None, "tradesum": None,
-                                              "trades": []}
+                                              "susum": None, "cgsum": None, "mktact": None,
+                                              "tradesum": None, "trades": []}
 
 
 def _spawn_worker():
@@ -352,6 +354,36 @@ def status():
         su_block = (f"<div class='row'><span class='k'>🌿 지속형 관찰:</span> 수집 중 "
                     f"<span style='color:#aaa;font-size:0.8em'>(폭발형 대조군, 알림 없음)</span></div>")
 
+    # 🔴 C등급 관찰 (알림 대신 관찰 전환된 것들)
+    cg_block = ""
+    try:
+        cgs = json.loads(d.get("cgsum") or "{}")
+    except Exception:
+        cgs = {}
+    if cgs.get("n"):
+        def fmt5(v):
+            return f"{v:+.1f}%" if v is not None else "-"
+        d4 = None
+        if ps.get("hit10_pct") is not None:
+            d4 = cgs.get("hit10_pct", 0) - ps.get("hit10_pct", 0)
+        d4_txt = ""
+        if d4 is not None:
+            c4 = "#2ecc71" if d4 > 5 else ("#e74c3c" if d4 < -5 else "#888")
+            d4_txt = f" <span style='color:{c4}'>(정식알림 대비 {d4:+.0f}%p)</span>"
+        cg_block = (
+            f"<div class='chart'><div class='k' style='font-size:0.9em;margin-bottom:8px'>"
+            f"🔴 C등급 관찰 (완료 {cgs['n']}건 · 알림 억제됨)</div>"
+            f"<div style='font-size:1.05em;margin-bottom:6px'>+10% 도달률: <b>{cgs.get('hit10_pct','?')}%</b>{d4_txt}</div>"
+            f"<div style='font-size:0.88em;color:#555'>"
+            f"중앙값 — 1h {fmt5(cgs.get('med_r1'))} · 6h {fmt5(cgs.get('med_r6'))} · 24h {fmt5(cgs.get('med_r24'))}<br>"
+            f"평균 최고점 {fmt5(cgs.get('avg_peak'))} · 최악낙폭 {fmt5(cgs.get('worst'))}</div>"
+            f"<div class='k' style='font-size:0.75em;margin-top:6px'>"
+            f"1h 수익이 정식알림보다 확실히 나쁘면 억제 유지 · 아니면 CGRADE_ALERT=1로 복원</div></div>"
+        )
+    else:
+        cg_block = (f"<div class='row'><span class='k'>🔴 C등급 관찰:</span> 수집 중 "
+                    f"<span style='color:#aaa;font-size:0.8em'>(알림 억제 중, 성과만 기록)</span></div>")
+
     # 🌐 시장 활성도 (거래량 신호 보정 지수)
     try:
         mact = float(d.get("mktact")) if d.get("mktact") else None
@@ -429,6 +461,7 @@ def status():
 {shadow_block}
 {dd_block}
 {su_block}
+{cg_block}
 {trade_block}
 {arch_block}
 <p style='color:#aaa;font-size:0.85em;margin-top:30px'>30초마다 자동 새로고침 · 사이클 숫자가 계속 올라가면 정상</p>
@@ -440,7 +473,8 @@ def status():
 <div style='font-weight:bold;margin-bottom:6px'>📢 발송 근거 = 점수 (65점 이상만 알림)</div>
 <table style='width:100%;border-collapse:collapse'>
 <tr style='color:#888;font-size:0.9em'><td>항목</td><td style='text-align:right'>최대</td><td style='text-align:right'>만점조건</td></tr>
-<tr><td>거래량 급증</td><td style='text-align:right'><b>30</b></td><td style='text-align:right;color:#888'>시간평균 5배</td></tr>
+<tr><td>거래량 급증(1h)</td><td style='text-align:right'><b>20</b></td><td style='text-align:right;color:#888'>시간평균 5배</td></tr>
+<tr><td>거래량 폭증(5m)</td><td style='text-align:right'><b>10</b></td><td style='text-align:right;color:#888'>5분평균 6.7배 <b>※조기감지</b></td></tr>
 <tr><td>1h 가격모멘텀</td><td style='text-align:right'><b>20</b></td><td style='text-align:right;color:#888'>1h +100%</td></tr>
 <tr><td>매수 압력</td><td style='text-align:right'><b>15</b></td><td style='text-align:right;color:#888'>매수비율 100%</td></tr>
 <tr><td>5분 모멘텀</td><td style='text-align:right'><b>10</b></td><td style='text-align:right;color:#888'>5m +10%</td></tr>
@@ -463,6 +497,10 @@ def status():
 <tr><td>🔓 다소집중 ⚠️</td><td style='text-align:right;color:#888'>20~50%</td></tr>
 <tr><td>🚫 초집중 ⚠️</td><td style='text-align:right;color:#888'>≥50% 사기수준</td></tr>
 <tr><td>⚠️ 봇펌핑의심</td><td style='text-align:right;color:#888'>20분내 +100%</td></tr>
+<tr><td>💧 유동성 얇음 ⚠️</td><td style='text-align:right;color:#888'>시총의 3% 미만</td></tr>
+<tr><td>💧 유동성 두터움</td><td style='text-align:right;color:#888'>시총의 8% 이상</td></tr>
+<tr><td>⚠️ 매수 착시</td><td style='text-align:right;color:#888'>건수-금액 괴리 15%p+</td></tr>
+<tr><td>💵 금액도 매수우세</td><td style='text-align:right;color:#888'>금액기준 60%+</td></tr>
 <tr><td>🏆 검증된코인</td><td style='text-align:right;color:#888'>7일+ 생존(눌림목)</td></tr>
 </table>
 
@@ -481,6 +519,23 @@ def status():
 
 <div style='font-weight:bold;margin:14px 0 6px'>⏱ 나이 필터 (20분 미만 제외 — 검증 진행중)</div>
 <div style='color:#555'>정식 알림은 상장 20분+ 코인만. 20분 미만은 <b>알림 없이 섀도우 추적</b>만 하여 이 기준이 실제로 유효한지 데이터로 검증 중(위 🔬 섀도우추적 항목).</div>
+
+<div style='font-weight:bold;margin:14px 0 6px'>💵 매수비율: 건수 vs 금액 (2026-07-24 추가)</div>
+<div style='color:#555'>
+DexScreener는 매수/매도 <b>건수만</b> 제공 → 소액매수 다수 vs 대형매도 소수를 "매수세 강함"으로 오독 가능.<br>
+<span style='color:#888'>실례: 건수 75%(21,064 vs 6,955)인데 금액은 51%($432K vs $414K) — 평균 매도가 3배 큼 = 분산 구간</span><br>
+→ GeckoTerminal 체결내역으로 <b>금액 기준</b>을 교차검증. 괴리 15%p 이상이면 ⚠️매수 착시 경고.<br>
+알림 표기: "매수/매도 N/M(건수) · 💵금액매수 X%"</div>
+
+<div style='font-weight:bold;margin:14px 0 6px'>💧 유동성은 절대금액 아닌 시총 대비 비율로 (2026-07-24)</div>
+<div style='color:#555'>같은 $30K도 시총 $200K면 15%(두터움), $5M이면 0.6%(극도로 얇음).<br>
+절대 하한 $30K는 유지하되, 비율로 위험도를 추가 판정.</div>
+
+<div style='font-weight:bold;margin:14px 0 6px'>🔴 C등급 알림 억제 (2026-07-24~)</div>
+<div style='color:#555'>
+C등급(👎 주의 = 과열·초저시총·홀더집중 등)은 <b>알림 없이 관찰만</b>.<br>
+근거: 1차 자기교정에서 C등급은 peak +63%로 높지만 1시간 뒤 -27.5%로 최악 (내부자 펌프덤프 프로파일)<br>
+되돌리려면 환경변수 <code>CGRADE_ALERT=1</code></div>
 
 <div style='font-weight:bold;margin:14px 0 6px'>🌿 지속형 가설 (2026-07-24 관찰 시작)</div>
 <div style='color:#555'>
@@ -533,6 +588,7 @@ def export():
             ["GET", "perf:summary_shadow"],
             ["GET", "perf:summary_doubledip"],
             ["GET", "perf:summary_sustain"],
+            ["GET", "perf:summary_cgrade"],
         ]
         resp = requests.post(
             screener.UPSTASH_URL + "/pipeline",
@@ -548,6 +604,7 @@ def export():
             "perf_summary_shadow": vals[4],
             "perf_summary_doubledip": vals[5],
             "perf_summary_sustain": vals[6],
+            "perf_summary_cgrade": vals[7],
         }, 200
     except Exception as e:
         return {"error": str(e)}, 500

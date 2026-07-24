@@ -94,6 +94,24 @@ SUSTAIN_H1_MAX    = float(os.getenv("SUSTAIN_H1_MAX", "50"))        # 폭발형 
 SUSTAIN_H24_MIN   = float(os.getenv("SUSTAIN_H24_MIN", "0"))        # 24h 기준 최소한 마이너스는 아님
 SUSTAIN_TTL       = int(os.getenv("SUSTAIN_TTL_SEC", "43200"))      # 동일코인 재등록 방지 12시간
 
+# --- C등급 처리 (2026-07-24) ---
+# 1차 자기교정에서 C등급은 peak +63%로 높지만 r1 -27.5%로 최악 = 내부자 펌프덤프 프로파일.
+# 기본값: 알림 없이 관찰만(kind="cgrade"). 1로 두면 기존처럼 알림 발송.
+CGRADE_ALERT = os.getenv("CGRADE_ALERT", "0") == "1"
+
+# --- 금액 기준 매수비율 (GeckoTerminal 체결내역) ---
+# DexScreener txns는 '건수'만 제공 → 소액매수 다수 vs 대형매도 소수를 매수세로 오독 가능.
+# 알림 직전(점수 통과한 소수)에만 호출해서 API 부담 최소화.
+BUYVOL_ENABLE     = os.getenv("BUYVOL_ENABLE", "1") == "1"
+BUYVOL_MIN_TRADES = int(os.getenv("BUYVOL_MIN_TRADES", "20"))   # 이 미만이면 표본 부족으로 무시
+BUYVOL_GAP_WARN   = float(os.getenv("BUYVOL_GAP_WARN", "15"))   # 건수-금액 괴리 %p 이상이면 착시 경고
+
+# --- 유동성/시총 비율 (A제안) ---
+# 같은 $30K 유동성도 시총 $200K면 15%(건전), $5M이면 0.6%(극도로 얇음).
+# 절대 하한은 유지하되 비율로 위험도를 추가 판정.
+TAG_LIQ_RATIO_WARN = float(os.getenv("TAG_LIQ_RATIO_WARN", "3"))   # 시총 대비 3% 미만 = 얇음
+TAG_LIQ_RATIO_GOOD = float(os.getenv("TAG_LIQ_RATIO_GOOD", "8"))   # 8% 이상 = 두터움
+
 # --- 원클릭 매수 버튼 ---
 # 알림에 표시할 SOL 매수 금액 세트 (쉼표 구분). 누르면 Jupiter 스왑 페이지가 해당 금액으로 열림
 BUY_AMOUNTS = [a.strip() for a in os.getenv("BUY_AMOUNTS_SOL", "0.5,1,2").split(",") if a.strip()]
@@ -489,10 +507,12 @@ def _perf_summarize():
         shadow_items = [i for i in items if i.get("kind") == "shadow"]
         dd_items = [i for i in items if i.get("kind") == "doubledip"]
         su_items = [i for i in items if i.get("kind") == "sustain"]
+        cg_items = [i for i in items if i.get("kind") == "cgrade"]
         s1 = summarize(alert_items)
         s2 = summarize(shadow_items)
         s3 = summarize(dd_items)
         s4 = summarize(su_items)
+        s5 = summarize(cg_items)
         sets = []
         if s1:
             sets.append(["SET", "perf:summary", json.dumps(s1)])
@@ -502,6 +522,8 @@ def _perf_summarize():
             sets.append(["SET", "perf:summary_doubledip", json.dumps(s3)])
         if s4:
             sets.append(["SET", "perf:summary_sustain", json.dumps(s4)])
+        if s5:
+            sets.append(["SET", "perf:summary_cgrade", json.dumps(s5)])
         if sets:
             r_pipe(sets)
 
@@ -787,6 +809,46 @@ def gecko_get(path, params=None):
     return None
 
 
+def buy_ratio_by_volume(pool_address, minutes=60):
+    """실제 '금액' 기준 매수비율 — GeckoTerminal 체결 내역 집계.
+    DexScreener는 txns에 '건수'만 주기 때문에, 소액 매수 다수 vs 대형 매도 소수인
+    분산(distribution) 구간을 매수세로 오독할 수 있음. 이를 교차검증한다.
+    반환: (ratio, buy_usd, sell_usd, n_trades) 또는 None."""
+    if not BUYVOL_ENABLE or not pool_address:
+        return None
+    data = gecko_get(f"networks/solana/pools/{pool_address}/trades")
+    if not data:
+        return None
+    cutoff = time.time() - minutes * 60
+    buy = sell = 0.0
+    n = 0
+    for t in (data.get("data") or []):
+        a = t.get("attributes") or {}
+        ts_raw = a.get("block_timestamp")
+        if ts_raw:
+            try:
+                ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00")).timestamp()
+                if ts < cutoff:
+                    continue
+            except (ValueError, TypeError):
+                pass  # 파싱 실패 시 시간 필터 생략하고 포함
+        try:
+            usd = float(a.get("volume_in_usd") or 0)
+        except (ValueError, TypeError):
+            continue
+        if usd <= 0:
+            continue
+        if (a.get("kind") or "").lower() == "buy":
+            buy += usd
+        else:
+            sell += usd
+        n += 1
+    total = buy + sell
+    if total <= 0 or n < BUYVOL_MIN_TRADES:
+        return None
+    return buy / total, buy, sell, n
+
+
 def collect_candidate_mints():
     """트렌딩 풀 + 신규 풀 + DexScreener 부스트에서 후보 mint 수집.
     반환: (mints, boosted, source_counts) — source_counts로 어느 소스가 비는지 추적."""
@@ -1012,13 +1074,19 @@ def score_pair(pair, boosted, ema_flag=None):
     v1 = float(vol.get("h1") or 0)
     v24 = float(vol.get("h24") or 0)
 
-    # 1) 거래량 급증: h1이 24h 시간평균 대비 몇 배인가 (최대 30점, 5배=만점)
+    # 1) 거래량 급증 (총 30점) — 반응속도 개선을 위해 h1(20) + m5(10)로 분할
+    #    h1만 보면 이제 막 터진 코인은 1시간 평균에 희석돼 늦게 잡힘.
+    #    m5는 24h를 288개(5분) 구간으로 나눈 평소치와 비교 → 훨씬 빠르게 감지.
+    vm5 = float(vol.get("m5") or 0)
     if v24 > 0:
         ratio = v1 / (v24 / 24)
-        pts = min(30, ratio * 6)
-        s += pts
+        s += min(20, ratio * 4)          # 5배 = 20점
         if ratio >= 3:
             reasons.append(f"거래량 {ratio:.1f}x 급증")
+        r5 = vm5 / (v24 / 288)
+        s += min(10, r5 * 1.5)           # 약 6.7배 = 10점
+        if r5 >= 5:
+            reasons.append(f"5분 거래량 {r5:.1f}x 폭증")
 
     # 2) 매수 압력 (최대 15점)
     buys, sells = int(txns.get("buys") or 0), int(txns.get("sells") or 0)
@@ -1026,7 +1094,7 @@ def score_pair(pair, boosted, ema_flag=None):
         br = buys / (buys + sells)
         s += max(0, (br - 0.5) * 100) * 0.3  # br=1.0 → 15점
         if br >= 0.65:
-            reasons.append(f"매수비율 {br*100:.0f}%")
+            reasons.append(f"매수비율 {br*100:.0f}%(건수)")
 
     # 3) 가격 모멘텀 (h1 최대 20점, m5 최대 10점)
     pc_h1 = float(pc.get("h1") or 0)
@@ -1439,7 +1507,7 @@ def build_insights(pair, top_holder_pct=None):
     return verdict, heat_line, holder_line
 
 
-def build_tags(pair, top_holder_pct=None):
+def build_tags(pair, top_holder_pct=None, buyvol=None):
     """전문가 기준 태그 생성 + 종합 판정.
     반환: (verdict_line, positive_tags, caution_tags)
       verdict_line: 종합 등급 한 줄 (예: '👍 양호 (긍정 3 · 주의 0)')
@@ -1489,6 +1557,25 @@ def build_tags(pair, top_holder_pct=None):
     if age_min is not None and age_min < TAG_BOT_AGE_MIN and pc_h1 >= TAG_BOT_PUMP_H1:
         cau.append(f"⚠️ 봇펌핑 의심 ({age_min:.0f}분만에 +{pc_h1:.0f}%)")
 
+    # 5) 유동성/시총 비율 (A) — 절대 $금액이 아니라 규모 대비로 얇기를 판정
+    liq = float((pair.get("liquidity") or {}).get("usd") or 0)
+    if mc > 0 and liq > 0:
+        lr = liq / mc * 100
+        if lr < TAG_LIQ_RATIO_WARN:
+            cau.append(f"💧 유동성 얇음 (시총의 {lr:.1f}%, {TAG_LIQ_RATIO_WARN:g}%↓ 슬리피지·조작 취약)")
+        elif lr >= TAG_LIQ_RATIO_GOOD:
+            pos.append(f"💧 유동성 두터움 (시총의 {lr:.0f}%)")
+
+    # 6) 매수 착시 — 건수는 매수 우세인데 금액은 아닌 경우 (분산 구간 의심)
+    if buyvol:
+        vr = buyvol[0] * 100
+        if buys + sells >= 30:
+            cr = buys / (buys + sells) * 100
+            if cr - vr >= BUYVOL_GAP_WARN:
+                cau.append(f"⚠️ 매수 착시 (건수 {cr:.0f}% vs 금액 {vr:.0f}%)")
+            elif vr >= 60:
+                pos.append(f"💵 금액도 매수우세 ({vr:.0f}%)")
+
     # 종합 판정: 긍정 개수 vs 주의 개수
     np, nc = len(pos), len(cau)
     if np + nc == 0:
@@ -1505,10 +1592,10 @@ def build_tags(pair, top_holder_pct=None):
     return verdict, pos, cau
 
 
-def entry_grade(pair, score, top_holder_pct=None):
+def entry_grade(pair, score, top_holder_pct=None, buyvol=None):
     """진입등급 S/A/B/C 계산 — 점수(모멘텀) × 종합판정(구조) × 과열도.
     반환: (등급, 한줄가이드)."""
-    verdict_line, _, _ = build_tags(pair, top_holder_pct)
+    verdict_line, _, _ = build_tags(pair, top_holder_pct, buyvol)
     v = verdict_line or ""
     _, heat_line, _ = build_insights(pair, top_holder_pct)
     overheated = bool(heat_line and "🔥" in heat_line)
@@ -1526,7 +1613,7 @@ def entry_grade(pair, score, top_holder_pct=None):
     return "B", "소액만 — 판정 정보 부족"
 
 
-def send_alert(pair, score, reasons, dangers, warns, top_holder_pct=None, detect_ts=None):
+def send_alert(pair, score, reasons, dangers, warns, top_holder_pct=None, detect_ts=None, buyvol=None):
     base = pair.get("baseToken") or {}
     sym = base.get("symbol", "?")
     name = base.get("name", "?")
@@ -1545,8 +1632,8 @@ def send_alert(pair, score, reasons, dangers, warns, top_holder_pct=None, detect
 
     reason_line = " / ".join(reasons) if reasons else "-"
     verdict, heat_line, holder_line = build_insights(pair, top_holder_pct)
-    tag_verdict, pos_tags, cau_tags = build_tags(pair, top_holder_pct)
-    grade, guide = entry_grade(pair, score, top_holder_pct)
+    tag_verdict, pos_tags, cau_tags = build_tags(pair, top_holder_pct, buyvol)
+    grade, guide = entry_grade(pair, score, top_holder_pct, buyvol)
 
     # ── 1초 판단용 압축 위험요약 (절대 숨기지 않음) ──
     grade_dot = {"S": "🟢", "A": "🟢", "B": "🟡", "C": "🔴"}.get(grade, "⚪")
@@ -1566,6 +1653,10 @@ def send_alert(pair, score, reasons, dangers, warns, top_holder_pct=None, detect
             risk_bits.append("초저시총🔬")
         elif "🐋" in t:
             risk_bits.append("고시총🐋")
+        elif "매수 착시" in t:
+            risk_bits.append("매수착시⚠️")
+        elif "유동성 얇음" in t:
+            risk_bits.append("유동성얇음💧")
     risk_line = ("⚠️ " + " · ".join(risk_bits)) if risk_bits else "🟢 주요 위험 신호 없음"
 
     header = (
@@ -1576,9 +1667,12 @@ def send_alert(pair, score, reasons, dangers, warns, top_holder_pct=None, detect
     )
 
     # 핵심 수치 2줄만 (스포일러 미지원 클라이언트 대응 — 짧게 쳐냄)
+    bv_txt = ""
+    if buyvol:
+        bv_txt = f" · 💵금액매수 {buyvol[0]*100:.0f}%"
     detail = (
         f"💰 ${price} · 💧{liq} · 거래량 {v1}\n"
-        f"📊 5m {pc.get('m5','?')}% · 매수/매도 {txns.get('buys','?')}/{txns.get('sells','?')} · 🎯{reason_line}"
+        f"📊 5m {pc.get('m5','?')}% · 매수/매도 {txns.get('buys','?')}/{txns.get('sells','?')}(건수){bv_txt} · 🎯{reason_line}"
     )
 
     msg = (
@@ -1696,16 +1790,29 @@ def main():
                     r_cmd("SETEX", f"alerted:{mint}", COOLDOWN_SEC, "rug")
                     continue
 
+                # 금액 기준 매수비율 교차검증 (점수 통과한 소수만 호출 → API 부담 최소)
+                buyvol = buy_ratio_by_volume(pair.get("pairAddress", ""))
+                if buyvol:
+                    print(f"[BUYVOL] {sym} 금액매수 {buyvol[0]*100:.0f}% (buy ${buyvol[1]:,.0f} / sell ${buyvol[2]:,.0f}, {buyvol[3]}건)")
+
+                # ★ C등급(👎 주의)은 알림 없이 관찰만 — 자기교정에서 r1 최악으로 확인된 프로파일
+                grade_now, _ = entry_grade(pair, final_score, top_pct, buyvol)
+                if grade_now == "C" and not CGRADE_ALERT:
+                    r_cmd("SETEX", f"alerted:{mint}", COOLDOWN_SEC, f"C{final_score}")
+                    perf_add(mint, sym, "cgrade", float(pair.get("priceUsd") or 0))
+                    print(f"[C-OBS] {sym} score={final_score} C등급 → 관찰만 (알림 없음)")
+                    continue
+
                 detect_ts = time.time()  # 발송 확정 시각 (지연 배지 기준점)
-                sent_ok = send_alert(pair, final_score, reasons, dangers, warns or 0, top_pct, detect_ts)
+                sent_ok = send_alert(pair, final_score, reasons, dangers, warns or 0, top_pct, detect_ts, buyvol)
                 # 쿨다운은 발송 성공/실패 무관하게 설정 (실패해도 다음 사이클 폭주 방지)
                 r_cmd("SETEX", f"alerted:{mint}", COOLDOWN_SEC, str(final_score))
                 # 카운터/마지막알림은 실제 발송 성공했을 때만 기록 (status 정확성)
                 if sent_ok:
                     r_cmd("INCR", "status:alert_count")
                     r_cmd("SET", "status:last_alert", f"🚨{sym} ({final_score}) @ {datetime.now(timezone.utc).strftime('%m-%d %H:%M')}UTC")
-                    tv, _, _ = build_tags(pair, top_pct)
-                    g, _ = entry_grade(pair, final_score, top_pct)
+                    tv, _, _ = build_tags(pair, top_pct, buyvol)
+                    g, _ = entry_grade(pair, final_score, top_pct, buyvol)
                     archive_alert("pump", sym, final_score, pair, f"[{g}] {tv or ''}")
                     perf_add(mint, sym, "pump", float(pair.get("priceUsd") or 0))
                 else:
@@ -1739,6 +1846,14 @@ def main():
                         r_cmd("SETEX", f"dip_alerted:{mint}", DIP_COOLDOWN, "rug")
                         continue
                     detect_ts = time.time()
+                    # ★ 눌림목도 C등급(👎 주의)이면 알림 없이 관찰만 (급등과 동일 규칙)
+                    #   dip은 점수가 없으므로 등급 판정용 기준점수 70을 사용 (S 판정만 배제됨)
+                    dgrade, _ = entry_grade(pair, 70, top_pct)
+                    if dgrade == "C" and not CGRADE_ALERT:
+                        r_cmd("SETEX", f"dip_alerted:{mint}", DIP_COOLDOWN, "C")
+                        perf_add(mint, sym, "cgrade", float(pair.get("priceUsd") or 0))
+                        print(f"[C-OBS] {sym} 눌림목 C등급 → 관찰만 (알림 없음)")
+                        continue
                     dip_ok = send_dip_alert(pair, dip_reasons, warns or 0, top_pct, detect_ts)
                     r_cmd("SETEX", f"dip_alerted:{mint}", DIP_COOLDOWN, "1")
                     if dip_ok:
