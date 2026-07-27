@@ -181,14 +181,16 @@ def status():
 
     # 알림 아카이브 목록 HTML 생성
     arch_rows = ""
-    pump_ct = dip_ct = 0
+    pump_ct = dip_ct = su_ct = 0
     for rec in archive:
         try:
             parts = rec.split("|")
             kind, sym, score, verdict, change, ts = parts[:6]
-            icon = "🚨" if kind == "pump" else "🎯"
+            icon = {"pump":"🚨","dip":"🎯","sustain":"🌿"}.get(kind,"🚨")
             if kind == "pump":
                 pump_ct += 1
+            elif kind == "sustain":
+                su_ct += 1
             else:
                 dip_ct += 1
             score_txt = f" {score}점" if score not in ("-", "") else ""
@@ -207,7 +209,7 @@ def status():
         arch_block = (
             f"<div class='chart'>"
             f"<div class='k' style='font-size:0.9em;margin-bottom:10px'>"
-            f"📜 최근 알림 기록 (🚨급등 {pump_ct} · 🎯눌림목 {dip_ct})</div>"
+            f"📜 최근 알림 기록 (🚨급등 {pump_ct} · 🎯눌림목 {dip_ct} · 🌿지속형 {su_ct})</div>"
             f"{arch_rows}</div>"
         )
     else:
@@ -537,11 +539,11 @@ C등급(👎 주의 = 과열·초저시총·홀더집중 등)은 <b>알림 없�
 근거: 1차 자기교정에서 C등급은 peak +63%로 높지만 1시간 뒤 -27.5%로 최악 (내부자 펌프덤프 프로파일)<br>
 되돌리려면 환경변수 <code>CGRADE_ALERT=1</code></div>
 
-<div style='font-weight:bold;margin:14px 0 6px'>🌿 지속형 가설 (2026-07-24 관찰 시작)</div>
+<div style='font-weight:bold;margin:14px 0 6px'>🌿 지속형 <span style='color:#2ecc71'>(2026-07-27 정식 알림 승격)</span></div>
 <div style='color:#555'>
 "러그도 메이저도 아닌데 흐름이 유지되는" 중간대 코인이 폭발형 급등보다 나을까?<br>
 조건: 시총 $1M+ · 나이 6시간+ · 1h거래 250건+ · 과열아님(거래량/유동성 5배↓) · 1h -10~+50% · 24h 0%+<br>
-<b>미검증, 알림 없이 forward-test 중</b> (위 🌿 항목) — 정식 알림(폭발형)과 도달률 비교</div>
+<b>검증 완료</b>: n=35 기준 24h 플러스 37.1%(vs 나머지 7.9%) · -80%↓ 붕괴 11.4%(vs 74.8%) · 최저점 중앙 -14.6%(vs -82.4%)<br>→ <b>덜 오르지만 안 무너진다</b>가 확인되어 알림 발송 시작. 끄려면 <code>SUSTAIN_ALERT=0</code></div>
 
 <div style='font-weight:bold;margin:14px 0 6px'>🌀 2단눌림 가설 (2026-07-21 관찰 시작)</div>
 <div style='color:#555'>

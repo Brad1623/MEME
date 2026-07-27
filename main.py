@@ -93,6 +93,11 @@ SUSTAIN_H1_MIN    = float(os.getenv("SUSTAIN_H1_MIN", "-10"))       # 붕괴 아
 SUSTAIN_H1_MAX    = float(os.getenv("SUSTAIN_H1_MAX", "50"))        # 폭발형 제외 (그건 정식 알림 영역)
 SUSTAIN_H24_MIN   = float(os.getenv("SUSTAIN_H24_MIN", "0"))        # 24h 기준 최소한 마이너스는 아님
 SUSTAIN_TTL       = int(os.getenv("SUSTAIN_TTL_SEC", "43200"))      # 동일코인 재등록 방지 12시간
+# 2026-07-27 자기교정 결과 정식 알림 승격:
+#   지속형 n=35 → 24h 플러스 37.1% / -80%이하 붕괴 11.4% / trough중앙 -14.6%
+#   나머지 알림 n=151 → 24h 플러스 7.9% / 붕괴 74.8% / trough중앙 -82.4%
+#   "덜 오르지만 안 무너진다"가 데이터로 확인됨 → 알림 발송 시작 (끄려면 0)
+SUSTAIN_ALERT     = os.getenv("SUSTAIN_ALERT", "1") == "1"
 
 # --- C등급 처리 (2026-07-24) ---
 # 1차 자기교정에서 C등급은 peak +63%로 높지만 r1 -27.5%로 최악 = 내부자 펌프덤프 프로파일.
@@ -388,18 +393,23 @@ def positions_tick(pairs, activity=1.0):
 # ============================================================
 # 알림 성과 자동추적 (+10% 가설 검증)
 # ============================================================
-def perf_add(mint, sym, kind, price):
-    """알림 발송 시 24h 성과추적 등록."""
+def perf_add(mint, sym, kind, price, pool=None):
+    """알림 발송 시 24h 성과추적 등록.
+    pool: 등록 시점의 pairAddress. 같은 mint에 여러 풀이 있을 때
+          fetch_pairs가 '그 순간 유동성 최대 풀'을 고르므로, 풀이 바뀌면
+          가격이 수천배 튀어 추적 데이터가 오염됨 → 풀을 고정해서 방지."""
     if not PERF_ENABLE or not price or price <= 0:
         return
     ts = int(time.time())
     key = f"perf:p:{mint}:{ts}"
     item = {"mint": mint, "sym": sym, "kind": kind, "ap": price, "ts": ts,
-            "peak": 0.0, "trough": 0.0, "r1": None, "r6": None, "r24": None}
+            "pool": pool or "", "peak": 0.0, "trough": 0.0,
+            "r1": None, "r6": None, "r24": None}
     r_cmd("SET", key, json.dumps(item))
     r_cmd("SADD", "perf:index", key)
 
 
+PERF_SANITY_MAX_PCT = float(os.getenv("PERF_SANITY_MAX_PCT", "2000"))  # 이 초과 상승률은 데이터 오류로 간주
 DEEP_CRASH_EXIT_PCT = -80.0   # 이 낙폭 이하로 빠지면 조기종료 (24h까지 안 기다림 — 대부분 이 밑에서 안 살아남음)
 DEEP_CRASH_MIN_AGE_S = 1800   # 초반 변동성 노이즈 방지: 최소 30분 지난 뒤부터 조기종료 판정
 
@@ -434,8 +444,23 @@ def perf_tick(pairs):
         age = now - it["ts"]
         if pair:
             price = float(pair.get("priceUsd") or 0)
+            # ★ 풀 고정 검증: 등록 때와 다른 풀이면 가격 비교 자체가 무의미 → 갱신 스킵
+            cur_pool = pair.get("pairAddress") or ""
+            reg_pool = it.get("pool") or ""
+            if reg_pool and cur_pool and cur_pool != reg_pool:
+                price = 0     # 이번 사이클 갱신 건너뜀 (데이터 오염 방지)
+                if not it.get("pool_warned"):
+                    it["pool_warned"] = True
+                    print(f"[PERF] {it['sym']} 풀 변경 감지 — 추적 일시중단 (등록 {reg_pool[:8]} vs 현재 {cur_pool[:8]})")
             if price > 0 and it["ap"] > 0:
                 pnl = (price - it["ap"]) / it["ap"] * 100
+                # ★ 이상치 방어: 밈코인이라도 24h 내 +2000% 초과는 데이터 오류로 간주
+                if pnl > PERF_SANITY_MAX_PCT:
+                    print(f"[PERF] {it['sym']} 비정상 변동 {pnl:,.0f}% 무시 (풀 오매칭 추정)")
+                    pnl = None
+            else:
+                pnl = None
+            if pnl is not None:
                 it["peak"] = round(max(it["peak"], pnl), 1)
                 it["trough"] = round(min(it["trough"], pnl), 1)
                 if it["r1"] is None and age >= 3600:
@@ -1167,7 +1192,7 @@ def shadow_tick(pairs):
         r_cmd("SETEX", f"shadowed:{mint}", SHADOW_TTL, "1")
         sym = (pair.get("baseToken") or {}).get("symbol", "?")
         price = float(pair.get("priceUsd") or 0)
-        perf_add(mint, sym, "shadow", price)
+        perf_add(mint, sym, "shadow", price, pair.get("pairAddress"))
         print(f"[SHADOW] {sym} 추적시작 (20분 미만, 알림없음)")
 
 
@@ -1237,7 +1262,7 @@ def doubledip_tick(pairs):
             drop2 = (bounce_high - price) / bounce_high * 100 if bounce_high > 0 else 0
             if drop2 >= DOUBLEDIP_D2_PCT:
                 # ★ 2단 눌림 확정 — 알림 없이 관찰 등록만
-                perf_add(mint, sym, "doubledip", price)
+                perf_add(mint, sym, "doubledip", price, pair.get("pairAddress"))
                 print(f"[DOUBLEDIP] {sym} 2단눌림 확정 (1차 -{DOUBLEDIP_D1_PCT}%→반등→2차 -{drop2:.0f}%) 관찰등록, 알림없음")
                 writes.append(["DEL", f"doubledip:{mint}"])  # 확정 후 상태 종료(재확정 방지)
             else:
@@ -1295,9 +1320,22 @@ def sustain_tick(pairs):
             continue
         sym = (pair.get("baseToken") or {}).get("symbol", "?")
         writes.append(["SETEX", f"sustained:{mint}", SUSTAIN_TTL, "1"])
-        perf_add(mint, sym, "sustain", price)
+        perf_add(mint, sym, "sustain", price, pair.get("pairAddress"))
         pc = pair.get("priceChange") or {}
-        print(f"[SUSTAIN] {sym} 지속형 관찰등록 (1h {pc.get('h1')}% · 24h {pc.get('h24')}%), 알림없음")
+        if SUSTAIN_ALERT:
+            dangers, warns, top_pct = rugcheck(mint)
+            if dangers:
+                print(f"[SUSTAIN] {sym} RugCheck danger → 알림 스킵")
+                continue
+            send_sustain_alert(pair, warns or 0, top_pct, time.time())
+            r_cmd("INCR", "status:alert_count")
+            r_cmd("SET", "status:last_alert",
+                  f"🌿{sym} @ {datetime.now(timezone.utc).strftime('%m-%d %H:%M')}UTC")
+            tv, _, _ = build_tags(pair, top_pct)
+            archive_alert("sustain", sym, "-", pair, tv)
+            print(f"[SUSTAIN] {sym} 지속형 알림 발송 (1h {pc.get('h1')}% · 24h {pc.get('h24')}%)")
+        else:
+            print(f"[SUSTAIN] {sym} 지속형 관찰등록 (1h {pc.get('h1')}% · 24h {pc.get('h24')}%), 알림없음")
     if writes:
         r_pipe(writes)
 
@@ -1364,6 +1402,55 @@ def check_dip(pair, entry_h1=None):
     if is_veteran:
         reasons.append(f"🏆 검증된 코인 ({age_days:.0f}일 생존)")
     return True, reasons, is_veteran
+
+
+def send_sustain_alert(pair, warns, top_holder_pct=None, detect_ts=None):
+    """지속형 알림 — 폭발형과 성격이 달라 별도 포맷.
+    핵심 메시지: 높이 안 가지만 잘 안 무너짐 → 짧게 치고 빠지는 게 아니라 여유 있게."""
+    base = pair.get("baseToken") or {}
+    sym = base.get("symbol", "?"); name = base.get("name", "?")
+    mint = base.get("address", "")
+    price = pair.get("priceUsd", "?")
+    liq = fmt_usd((pair.get("liquidity") or {}).get("usd"))
+    v1 = fmt_usd((pair.get("volume") or {}).get("h1"))
+    pc = pair.get("priceChange") or {}
+    txns = (pair.get("txns") or {}).get("h1") or {}
+    created = pair.get("pairCreatedAt")
+    age = ""
+    if created:
+        h = (time.time() * 1000 - created) / 3600000
+        age = f"{h/24:.1f}일" if h >= 48 else f"{h:.0f}시간"
+    mc = float(pair.get("marketCap") or pair.get("fdv") or 0)
+    mc_txt = f"${mc/1_000_000:.1f}M" if mc >= 1_000_000 else f"${mc/1000:.0f}K"
+
+    tag_verdict, pos_tags, cau_tags = build_tags(pair, top_holder_pct)
+    risk_bits = []
+    if warns:
+        risk_bits.append(f"Rug⚠️{warns}")
+    for t in cau_tags:
+        if "🚫" in t:
+            risk_bits.append("홀더초집중🚫")
+        elif "🔓" in t:
+            risk_bits.append("홀더집중🔓")
+        elif "유동성 얇음" in t:
+            risk_bits.append("유동성얇음💧")
+        elif "매수 착시" in t:
+            risk_bits.append("매수착시⚠️")
+    risk_line = ("⚠️ " + " · ".join(risk_bits)) if risk_bits else "🟢 주요 위험 신호 없음"
+
+    msg = (
+        f"🌿 <b>{name} (${sym})</b>  지속형\n"
+        f"{{DELAY}} · 1h {pc.get('h1','?')}% · 24h {pc.get('h24','?')}% · {age} · 시총 {mc_txt}\n"
+        f"{risk_line}\n"
+        f"💡 급등 아님 — 안 무너지는 흐름. 급하게 안 쫓아도 됨\n"
+        f"💰 ${price} · 💧{liq} · 거래량 {v1}\n"
+        f"📊 매수/매도 {txns.get('buys','?')}/{txns.get('sells','?')}(건수)\n"
+        f"<code>{mint}</code>\n"
+        f'<a href="https://dexscreener.com/solana/{pair.get("pairAddress","")}">차트</a> · '
+        f'<a href="https://rugcheck.xyz/tokens/{mint}">Rug</a>'
+    )
+    return tg_send(msg, detect_ts=detect_ts,
+                   buttons=[(f"📌 진입 등록 (현재가·손절-{SELL_SL_PCT:g}%)", f"reg:{mint}")])
 
 
 def send_dip_alert(pair, reasons, warns, top_holder_pct=None, detect_ts=None):
@@ -1799,7 +1886,7 @@ def main():
                 grade_now, _ = entry_grade(pair, final_score, top_pct, buyvol)
                 if grade_now == "C" and not CGRADE_ALERT:
                     r_cmd("SETEX", f"alerted:{mint}", COOLDOWN_SEC, f"C{final_score}")
-                    perf_add(mint, sym, "cgrade", float(pair.get("priceUsd") or 0))
+                    perf_add(mint, sym, "cgrade", float(pair.get("priceUsd") or 0), pair.get("pairAddress"))
                     print(f"[C-OBS] {sym} score={final_score} C등급 → 관찰만 (알림 없음)")
                     continue
 
@@ -1814,7 +1901,7 @@ def main():
                     tv, _, _ = build_tags(pair, top_pct, buyvol)
                     g, _ = entry_grade(pair, final_score, top_pct, buyvol)
                     archive_alert("pump", sym, final_score, pair, f"[{g}] {tv or ''}")
-                    perf_add(mint, sym, "pump", float(pair.get("priceUsd") or 0))
+                    perf_add(mint, sym, "pump", float(pair.get("priceUsd") or 0), pair.get("pairAddress"))
                 else:
                     print(f"[ALERT-FAIL] {sym} 발송 실패 — 기록 스킵")
                 # dip 추적 목록에 등록 (이 코인이 나중에 눌리면 눌림목 알림)
@@ -1851,7 +1938,7 @@ def main():
                     dgrade, _ = entry_grade(pair, 70, top_pct)
                     if dgrade == "C" and not CGRADE_ALERT:
                         r_cmd("SETEX", f"dip_alerted:{mint}", DIP_COOLDOWN, "C")
-                        perf_add(mint, sym, "cgrade", float(pair.get("priceUsd") or 0))
+                        perf_add(mint, sym, "cgrade", float(pair.get("priceUsd") or 0), pair.get("pairAddress"))
                         print(f"[C-OBS] {sym} 눌림목 C등급 → 관찰만 (알림 없음)")
                         continue
                     dip_ok = send_dip_alert(pair, dip_reasons, warns or 0, top_pct, detect_ts)
@@ -1862,7 +1949,7 @@ def main():
                         r_cmd("SET", "status:last_alert", f"🎯{sym} @ {datetime.now(timezone.utc).strftime('%m-%d %H:%M')}UTC")
                         tv, _, _ = build_tags(pair, top_pct)
                         archive_alert("dip", sym, "-", pair, tv)
-                        perf_add(mint, sym, "dip", float(pair.get("priceUsd") or 0))
+                        perf_add(mint, sym, "dip", float(pair.get("priceUsd") or 0), pair.get("pairAddress"))
                         print(f"[DIP] {sym}")
                     else:
                         print(f"[DIP-FAIL] {sym} 발송 실패")
