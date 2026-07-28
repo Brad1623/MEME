@@ -395,6 +395,77 @@ def positions_tick(pairs, activity=1.0):
 # ============================================================
 # 알림 성과 자동추적 (+10% 가설 검증)
 # ============================================================
+# ============================================================
+# 통합 저장소 (Upstash 커맨드 절감 핵심)
+# ------------------------------------------------------------
+# Upstash는 'HTTP 요청'이 아니라 '커맨드' 단위로 과금한다.
+# 파이프라인으로 묶어도 커맨드 수는 그대로이므로, 커맨드 개수 자체를 줄여야 한다.
+#   기존: 후보 40개 → alerted:{mint} 40회 GET / perf 50건 → 50 GET + 50 SET
+#   변경: 단일 키 하나를 GET/SET (사이클당 2커맨드)
+# ============================================================
+_CD = {"data": None, "dirty": False}      # 쿨다운 통합: {"kind:mint": 만료ts}
+_PF = {"data": None, "dirty": False}      # 성과추적 통합: {key: item}
+
+
+def cd_load():
+    """쿨다운 맵 로드 (사이클당 1회). 만료분은 로드 시 정리."""
+    if _CD["data"] is None:
+        raw = r_cmd("GET", "cd:all")
+        try:
+            d = json.loads(raw) if raw else {}
+        except Exception:
+            d = {}
+        now = time.time()
+        pruned = {k: v for k, v in d.items() if _cd_exp(v) > now}
+        if len(pruned) != len(d):
+            _CD["dirty"] = True
+        _CD["data"] = pruned
+    return _CD["data"]
+
+
+def _cd_exp(v):
+    return v[0] if isinstance(v, list) else (v or 0)
+
+
+def cd_has(kind, mint):
+    return _cd_exp(cd_load().get(f"{kind}:{mint}")) > time.time()
+
+
+def cd_set(kind, mint, ttl, val=None):
+    """만료시각 저장. val이 있으면 [만료ts, 값] 형태로 부가정보도 함께 보존."""
+    cd_load()[f"{kind}:{mint}"] = (time.time() + ttl) if val is None else [time.time() + ttl, val]
+    _CD["dirty"] = True
+
+
+def cd_val(kind, mint):
+    """cd_set에 저장한 부가값 반환 (없으면 None)."""
+    v = cd_load().get(f"{kind}:{mint}")
+    return v[1] if isinstance(v, list) and len(v) > 1 else None
+
+
+def cd_flush():
+    if _CD["dirty"] and _CD["data"] is not None:
+        r_cmd("SET", "cd:all", json.dumps(_CD["data"]))
+        _CD["dirty"] = False
+
+
+def pf_load():
+    """성과추적 맵 로드 (틱당 1회)."""
+    if _PF["data"] is None:
+        raw = r_cmd("GET", "perf:active")
+        try:
+            _PF["data"] = json.loads(raw) if raw else {}
+        except Exception:
+            _PF["data"] = {}
+    return _PF["data"]
+
+
+def pf_flush():
+    if _PF["dirty"] and _PF["data"] is not None:
+        r_cmd("SET", "perf:active", json.dumps(_PF["data"]))
+        _PF["dirty"] = False
+
+
 def perf_add(mint, sym, kind, price, pool=None):
     """알림 발송 시 24h 성과추적 등록.
     pool: 등록 시점의 pairAddress. 같은 mint에 여러 풀이 있을 때
@@ -403,12 +474,11 @@ def perf_add(mint, sym, kind, price, pool=None):
     if not PERF_ENABLE or not price or price <= 0:
         return
     ts = int(time.time())
-    key = f"perf:p:{mint}:{ts}"
-    item = {"mint": mint, "sym": sym, "kind": kind, "ap": price, "ts": ts,
-            "pool": pool or "", "peak": 0.0, "trough": 0.0,
-            "r1": None, "r6": None, "r24": None}
-    r_cmd("SET", key, json.dumps(item))
-    r_cmd("SADD", "perf:index", key)
+    key = f"{mint}:{ts}"
+    pf_load()[key] = {"mint": mint, "sym": sym, "kind": kind, "ap": price, "ts": ts,
+                      "pool": pool or "", "peak": 0.0, "trough": 0.0,
+                      "r1": None, "r6": None, "r24": None}
+    _PF["dirty"] = True
 
 
 PERF_SANITY_MAX_PCT = float(os.getenv("PERF_SANITY_MAX_PCT", "2000"))  # 이 초과 상승률은 데이터 오류로 간주
@@ -421,26 +491,17 @@ def perf_tick(pairs):
     ★ Redis 절감: 개별 GET/SET을 파이프라인으로 일괄 처리 + 깊은 붕괴 조기종료로 추적기간 단축."""
     if not PERF_ENABLE:
         return
-    keys = r_cmd("SMEMBERS", "perf:index") or []
+    active = pf_load()
     now = int(time.time())
-    if not keys:
+    if not active:
         _perf_summarize()
         return
 
-    # ① 전체 항목 1회 파이프라인으로 조회 (기존: 항목당 GET N회 → 1회)
-    raws = r_pipe([["GET", k] for k in keys])
-
-    writes = []       # 갱신 SET 묶음
-    cleanups = []     # 완료/무효 항목 정리 묶음
     done_push = []    # perf:done 추가 묶음
-    for k, raw in zip(keys, raws):
-        if not raw:
-            cleanups.append(["SREM", "perf:index", k])
-            continue
-        try:
-            it = json.loads(raw)
-        except Exception:
-            cleanups.append(["SREM", "perf:index", k])
+    for k in list(active.keys()):
+        it = active[k]
+        if not isinstance(it, dict):
+            active.pop(k, None); _PF["dirty"] = True
             continue
         pair = pairs.get(it["mint"])
         age = now - it["ts"]
@@ -479,22 +540,17 @@ def perf_tick(pairs):
             it["r24"] = it["trough"]     # 사실상 바닥이므로 trough를 r24 대용으로 기록
             it["early_exit"] = "deep_crash"
 
+        _PF["dirty"] = True
         if it["r24"] is not None or age > 90000:
             done_push.append(["LPUSH", "perf:done", json.dumps(it)])
-            cleanups.append(["SREM", "perf:index", k])
-            cleanups.append(["DEL", k])
-        else:
-            writes.append(["SET", k, json.dumps(it)])
+            active.pop(k, None)
 
-    # ② 갱신·완료·정리를 파이프라인으로 일괄 실행
-    batch = writes + done_push
+    # 갱신은 단일 키 1회 SET으로 (기존: 항목당 SET N회)
+    pf_flush()
     if done_push:
-        batch.append(["LTRIM", "perf:done", 0, 199])
-    batch += cleanups
-    if batch:
-        r_pipe(batch)
-
-    _perf_summarize()
+        done_push.append(["LTRIM", "perf:done", 0, 199])
+        r_pipe(done_push)
+        _perf_summarize()      # 완료분 생겼을 때만 재집계 (LRANGE+SET 절감)
 
 
 def _perf_summarize():
@@ -1199,9 +1255,9 @@ def shadow_tick(pairs):
     for mint, pair in pairs.items():
         if not passes_shadow_filters(pair):
             continue
-        if r_cmd("GET", f"shadowed:{mint}"):
+        if cd_has("shadow", mint):
             continue
-        r_cmd("SETEX", f"shadowed:{mint}", SHADOW_TTL, "1")
+        cd_set("shadow", mint, SHADOW_TTL)
         sym = (pair.get("baseToken") or {}).get("symbol", "?")
         price = float(pair.get("priceUsd") or 0)
         perf_add(mint, sym, "shadow", price, pair.get("pairAddress"))
@@ -1325,13 +1381,13 @@ def sustain_tick(pairs):
         return
 
     # 중복 등록 방지 확인을 파이프라인 1회로
-    flags = r_pipe([["GET", f"sustained:{m}"] for m, _, _ in cands])
+    cd_load()
     writes = []
-    for (mint, pair, price), flag in zip(cands, flags):
-        if flag:
+    for (mint, pair, price) in cands:
+        if cd_has("sustain", mint):
             continue
         sym = (pair.get("baseToken") or {}).get("symbol", "?")
-        writes.append(["SETEX", f"sustained:{mint}", SUSTAIN_TTL, "1"])
+        cd_set("sustain", mint, SUSTAIN_TTL)
         perf_add(mint, sym, "sustain", price, pair.get("pairAddress"))
         pc = pair.get("priceChange") or {}
         if SUSTAIN_ALERT:
@@ -1813,27 +1869,19 @@ def main():
 
             # 포지션·성과추적·눌림목추적 코인은 트렌딩에서 빠져도 항상 시세 확보 (감시 필수)
             # ★ Redis 절감: 개별 SMEMBERS 2~3회 → 파이프라인 1회
-            idx_cmds = [["SMEMBERS", "pos:index"]]
-            if PERF_ENABLE:
-                idx_cmds.append(["SMEMBERS", "perf:index"])
-            if DIP_ENABLE:
-                idx_cmds.append(["KEYS", "dip_track:*"])
-            idx_res = r_pipe(idx_cmds)
-            for pm in (idx_res[0] or []):
+            # 포지션은 SMEMBERS 1회, 성과추적은 통합맵에서 (커맨드 절감)
+            for pm in (r_cmd("SMEMBERS", "pos:index") or []):
                 mints.add(pm)
-            ri = 1
             if PERF_ENABLE:
-                for pk in (idx_res[ri] or []):
-                    seg = pk.split(":")
-                    if len(seg) >= 3:
-                        mints.add(seg[2])
-                ri += 1
+                for it in pf_load().values():
+                    if isinstance(it, dict) and it.get("mint"):
+                        mints.add(it["mint"])
             if DIP_ENABLE:
-                # dip_track:{mint} → mint 추출. 추적중인 코인이 트렌딩에서 빠져도
-                # 시세를 확보해야 눌림목 감시가 끊기지 않음 (눌림목 0건 원인 대응)
-                for dk in (idx_res[ri] or []):
-                    if ":" in dk:
-                        mints.add(dk.split(":", 1)[1])
+                # dip 추적중 코인도 시세 확보 (트렌딩에서 빠져도 감시 유지)
+                now_ts = time.time()
+                for k, exp in cd_load().items():
+                    if k.startswith("dip_track:") and _cd_exp(exp) > now_ts:
+                        mints.add(k.split(":", 1)[1])
 
             pairs = fetch_pairs(mints)
 
@@ -1850,11 +1898,11 @@ def main():
             # 안 그러면 쿨다운 걸린 상위 코인들이 정밀검사 슬롯(OHLCV_TOP_N)을
             # 다 차지해서, 그 아래의 새 급등 코인이 검사조차 못 받음.
             # ★ Redis 절감: 후보 N개 개별 GET → 파이프라인 1회
-            cd_flags = r_pipe([["GET", f"alerted:{m}"] for _, m, _ in scored]) if scored else []
+            cd_load()   # 쿨다운 맵 1회 로드 (기존: 후보마다 개별 GET)
             fresh = []
             skipped_cd = 0
-            for item, flag in zip(scored, cd_flags):
-                if flag:
+            for item in scored:
+                if cd_has("pump", item[1]):
                     skipped_cd += 1
                     continue
                 fresh.append(item)
@@ -1862,16 +1910,17 @@ def main():
                 print(f"[cycle {cycle}] 쿨다운 스킵 {skipped_cd}개 → 새 후보 {len(fresh)}개 정밀검사 대상")
 
             # 상태 기록도 파이프라인 1회로 통합 (기존 개별 SET/LPUSH/LTRIM 5회)
+            # 상태 기록: 개별 키 5~7개 → 통합 JSON 1개 (커맨드 절감)
             hist = f"{n}:{src['gecko_trend']}:{src['gecko_new']}:{src['dex_boost']}"
-            r_pipe([
-                ["SET", "status:cycle", cycle],
-                ["SET", "status:candidates", n],
-                ["SET", "status:last_scan", int(time.time())],
-                ["LPUSH", "status:history", hist],
-                ["LTRIM", "status:history", 0, 19],
-                ["SET", "status:cooldown_skip", skipped_cd],
-                ["SET", "status:fresh_count", len(fresh)],
-            ])
+            st_cmds = [["SET", "status:main", json.dumps({
+                "cycle": cycle, "candidates": n, "last_scan": int(time.time()),
+                "cooldown_skip": skipped_cd, "fresh": len(fresh),
+            })]]
+            # 흐름 이력은 매 사이클 아닌 3사이클(6분)마다만 기록
+            if cycle % 3 == 0:
+                st_cmds.append(["LPUSH", "status:history", hist])
+                st_cmds.append(["LTRIM", "status:history", 0, 19])
+            r_pipe(st_cmds)
 
             # 쿨다운 제거된 새 후보 중 상위만 EMA + RugCheck 정밀 검사
             for base_score, mint, pair in fresh[:OHLCV_TOP_N]:
@@ -1886,7 +1935,7 @@ def main():
                 dangers, warns, top_pct = rugcheck(mint)
                 if dangers:
                     print(f"[skip-rug] {sym} {mint}: {dangers}")
-                    r_cmd("SETEX", f"alerted:{mint}", COOLDOWN_SEC, "rug")
+                    cd_set("pump", mint, COOLDOWN_SEC)
                     continue
 
                 # 금액 기준 매수비율 교차검증 (점수 통과한 소수만 호출 → API 부담 최소)
@@ -1897,7 +1946,7 @@ def main():
                 # ★ C등급(👎 주의)은 알림 없이 관찰만 — 자기교정에서 r1 최악으로 확인된 프로파일
                 grade_now, _ = entry_grade(pair, final_score, top_pct, buyvol)
                 if grade_now == "C" and not CGRADE_ALERT:
-                    r_cmd("SETEX", f"alerted:{mint}", COOLDOWN_SEC, f"C{final_score}")
+                    cd_set("pump", mint, COOLDOWN_SEC)
                     perf_add(mint, sym, "cgrade", float(pair.get("priceUsd") or 0), pair.get("pairAddress"))
                     print(f"[C-OBS] {sym} score={final_score} C등급 → 관찰만 (알림 없음)")
                     continue
@@ -1905,7 +1954,7 @@ def main():
                 detect_ts = time.time()  # 발송 확정 시각 (지연 배지 기준점)
                 sent_ok = send_alert(pair, final_score, reasons, dangers, warns or 0, top_pct, detect_ts, buyvol)
                 # 쿨다운은 발송 성공/실패 무관하게 설정 (실패해도 다음 사이클 폭주 방지)
-                r_cmd("SETEX", f"alerted:{mint}", COOLDOWN_SEC, str(final_score))
+                cd_set("pump", mint, COOLDOWN_SEC)
                 # 카운터/마지막알림은 실제 발송 성공했을 때만 기록 (status 정확성)
                 if sent_ok:
                     r_cmd("INCR", "status:alert_count")
@@ -1920,20 +1969,19 @@ def main():
                 # 값 = 등록 시점의 1h 상승률 (나중에 추세붕괴 판정에 사용)
                 if DIP_ENABLE:
                     entry_h1 = float((pair.get("priceChange") or {}).get("h1") or 0)
-                    r_cmd("SETEX", f"dip_track:{mint}", DIP_TRACK_SEC, str(entry_h1))
+                    cd_set("dip_track", mint, DIP_TRACK_SEC, entry_h1)
                 print(f"[ALERT] {sym} score={final_score}")
                 time.sleep(1)
 
             # ---- 눌림목(DIP) 스캔: 최근 급등해서 추적중인 코인 중 눌린 것 ----
             if DIP_ENABLE:
                 for mint, pair in pairs.items():
-                    track_val = r_cmd("GET", f"dip_track:{mint}")
-                    if not track_val:
-                        continue  # 급등 이력 없는 코인은 대상 아님
-                    if r_cmd("GET", f"dip_alerted:{mint}"):
+                    if not cd_has("dip_track", mint):
+                        continue
+                    if cd_has("dip", mint):
                         continue  # dip 알림 쿨다운 중
                     try:
-                        entry_h1 = float(track_val)
+                        entry_h1 = float(cd_val("dip_track", mint))
                     except (ValueError, TypeError):
                         entry_h1 = None
                     is_dip, dip_reasons, is_veteran = check_dip(pair, entry_h1)
@@ -1942,19 +1990,19 @@ def main():
                     sym = (pair.get("baseToken") or {}).get("symbol", "")
                     dangers, warns, top_pct = rugcheck(mint)
                     if dangers:
-                        r_cmd("SETEX", f"dip_alerted:{mint}", DIP_COOLDOWN, "rug")
+                        cd_set("dip", mint, DIP_COOLDOWN)
                         continue
                     detect_ts = time.time()
                     # ★ 눌림목도 C등급(👎 주의)이면 알림 없이 관찰만 (급등과 동일 규칙)
                     #   dip은 점수가 없으므로 등급 판정용 기준점수 70을 사용 (S 판정만 배제됨)
                     dgrade, _ = entry_grade(pair, 70, top_pct)
                     if dgrade == "C" and not CGRADE_ALERT:
-                        r_cmd("SETEX", f"dip_alerted:{mint}", DIP_COOLDOWN, "C")
+                        cd_set("dip", mint, DIP_COOLDOWN)
                         perf_add(mint, sym, "cgrade", float(pair.get("priceUsd") or 0), pair.get("pairAddress"))
                         print(f"[C-OBS] {sym} 눌림목 C등급 → 관찰만 (알림 없음)")
                         continue
                     dip_ok = send_dip_alert(pair, dip_reasons, warns or 0, top_pct, detect_ts)
-                    r_cmd("SETEX", f"dip_alerted:{mint}", DIP_COOLDOWN, "1")
+                    cd_set("dip", mint, DIP_COOLDOWN)
                     if dip_ok:
                         # 눌림목도 status에 기록 (기존엔 급등만 기록해서 마지막알림이 안 바뀌던 버그)
                         r_cmd("INCR", "status:alert_count")
@@ -1983,6 +2031,12 @@ def main():
         except Exception:
             print(f"[cycle {cycle}] fatal:\n{traceback.format_exc()}")
         finally:
+            # 통합 저장소 변경분을 사이클당 1회만 기록 (커맨드 절감 핵심)
+            try:
+                cd_flush()
+                pf_flush()
+            except Exception as e:
+                print(f"[flush] error: {e}")
             # 무슨 일이 있어도(예외/빈응답 포함) 반드시 대기 → 사이클 폭주 원천 차단
             time.sleep(LOOP_SEC)
 

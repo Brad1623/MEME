@@ -23,7 +23,7 @@ def r_status():
     """status 표시용 데이터를 파이프라인 1회로 모두 읽기.
     GET 6개 + 히스토리 LRANGE 1개. 타임아웃 짧게 → 워커 안 막음."""
     get_keys = [
-        "status:cycle", "status:candidates", "status:last_scan",
+        "status:main", "status:candidates", "status:last_scan",
         "status:alert_count", "status:last_alert", "status:restart_count",
     ]
     try:
@@ -48,6 +48,15 @@ def r_status():
         results = resp.json()
         vals = [r.get("result") if isinstance(r, dict) else None for r in results]
         d = dict(zip(get_keys, vals[:6]))
+        # status:main(통합 JSON) → 기존 개별 필드로 펼침 (커맨드 절감 대응)
+        try:
+            main = json.loads(d.get("status:main") or "{}")
+        except Exception:
+            main = {}
+        if main:
+            d["status:cycle"] = main.get("cycle")
+            d["status:candidates"] = main.get("candidates")
+            d["status:last_scan"] = main.get("last_scan")
         d["history"] = vals[6] if len(vals) > 6 and vals[6] else []
         d["archive"] = vals[7] if len(vals) > 7 and vals[7] else []
         d["possnap"] = vals[8] if len(vals) > 8 else None
@@ -124,6 +133,15 @@ def health():
 def status():
     """봇이 실제로 스캔 중인지 + 후보수 흐름을 브라우저에서 확인."""
     d = r_status()
+    # status:main(통합 JSON)에서 펼쳐진 값 우선, 없으면 기본값
+    if "status:cycle" not in d:
+        try:
+            _m = json.loads(d.get("status:main") or "{}")
+        except Exception:
+            _m = {}
+        d["status:cycle"] = _m.get("cycle")
+        d["status:candidates"] = _m.get("candidates")
+        d["status:last_scan"] = _m.get("last_scan")
     cycle = d["status:cycle"] or "?"
     cand = d["status:candidates"] or "?"
     last_scan = d["status:last_scan"]
