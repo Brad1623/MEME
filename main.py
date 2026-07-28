@@ -101,6 +101,19 @@ SUSTAIN_TTL       = int(os.getenv("SUSTAIN_TTL_SEC", "43200"))      # 동일코�
 #   "덜 오르지만 안 무너진다"가 데이터로 확인됨 → 알림 발송 시작 (끄려면 0)
 SUSTAIN_ALERT     = os.getenv("SUSTAIN_ALERT", "1") == "1"
 
+# --- 조기 지속형 (2026-07-29): 문턱을 낮춰 '더 이른 그라인드 국면'을 잡히는지 검증 ---
+# 기존 지속형은 시총 $1M·거래 250건을 요구해서, 그 밑에서 올라오는 코인은 늦게 잡힘.
+# 완화 조건은 알림 없이 kind="sustain_early"로만 기록 → 결과 비교 후 승격 판단.
+SUSTAIN_EARLY_ENABLE = os.getenv("SUSTAIN_EARLY_ENABLE", "1") == "1"
+SUSTAIN_EARLY_MC     = float(os.getenv("SUSTAIN_EARLY_MC", "500000"))   # $1M → $500K
+SUSTAIN_EARLY_TXNS   = int(os.getenv("SUSTAIN_EARLY_TXNS", "120"))      # 250건 → 120건
+SUSTAIN_EARLY_AGE_H  = float(os.getenv("SUSTAIN_EARLY_AGE_H", "3"))     # 6시간 → 3시간
+SUSTAIN_EARLY_ALERT  = os.getenv("SUSTAIN_EARLY_ALERT", "1") == "1"     # 조기 티어도 알림 (미검증 표시됨)
+
+# --- 거래량 가속 (스파이크 임박 후보) ---
+# 가격은 아직 완만한데 거래량만 붙기 시작 = 매집 국면일 수 있음. 미검증 지표라 표시만.
+VOL_ACCEL_RATIO = float(os.getenv("VOL_ACCEL_RATIO", "1.8"))  # 1h 거래량이 6h평균의 N배 이상
+
 # --- C등급 처리 (2026-07-24) ---
 # 1차 자기교정에서 C등급은 peak +63%로 높지만 r1 -27.5%로 최악 = 내부자 펌프덤프 프로파일.
 # 기본값: 알림 없이 관찰만(kind="cgrade"). 1로 두면 기존처럼 알림 발송.
@@ -474,7 +487,7 @@ def perf_add(mint, sym, kind, price, pool=None):
     if not PERF_ENABLE or not price or price <= 0:
         return
     ts = int(time.time())
-    key = f"{mint}:{ts}"
+    key = f"{mint}:{kind}:{ts}"   # kind 포함 — 같은 코인이 여러 트랙에 동시 등록돼도 충돌 없음
     pf_load()[key] = {"mint": mint, "sym": sym, "kind": kind, "ap": price, "ts": ts,
                       "pool": pool or "", "peak": 0.0, "trough": 0.0,
                       "r1": None, "r6": None, "r24": None}
@@ -601,11 +614,13 @@ def _perf_summarize():
         dd_items = [i for i in items if i.get("kind") == "doubledip"]
         su_items = [i for i in items if i.get("kind") == "sustain"]
         cg_items = [i for i in items if i.get("kind") == "cgrade"]
+        se_items = [i for i in items if i.get("kind") == "sustain_early"]
         s1 = summarize(alert_items)
         s2 = summarize(shadow_items)
         s3 = summarize(dd_items)
         s4 = summarize(su_items)
         s5 = summarize(cg_items)
+        s6 = summarize(se_items)
         sets = []
         if s1:
             sets.append(["SET", "perf:summary", json.dumps(s1)])
@@ -617,6 +632,8 @@ def _perf_summarize():
             sets.append(["SET", "perf:summary_sustain", json.dumps(s4)])
         if s5:
             sets.append(["SET", "perf:summary_cgrade", json.dumps(s5)])
+        if s6:
+            sets.append(["SET", "perf:summary_sustain_early", json.dumps(s6)])
         if sets:
             r_pipe(sets)
 
@@ -1341,6 +1358,18 @@ def doubledip_tick(pairs):
         r_pipe(writes)
 
 
+def vol_accel(pair):
+    """거래량 가속도: 최근 1시간 거래량이 6시간 평균의 몇 배인가.
+    가격은 아직 완만한데 거래량만 붙는 = 매집 국면 후보 (미검증 지표, 표시용)."""
+    vol = pair.get("volume") or {}
+    v1 = float(vol.get("h1") or 0)
+    v6 = float(vol.get("h6") or 0)
+    if v6 <= 0 or v1 <= 0:
+        return None
+    ratio = v1 / (v6 / 6)
+    return round(ratio, 1) if ratio >= VOL_ACCEL_RATIO else None
+
+
 def sustain_tick(pairs):
     """지속형(sustained) 관찰 트래커 — 알림 없이 perf 등록만, 가설 검증용.
     '폭발형 급등'과 반대 프로파일: 이미 초기 구간을 넘겼고, 과열되지 않았는데
@@ -1360,50 +1389,60 @@ def sustain_tick(pairs):
         h1 = float(pc.get("h1") or 0)
         h24 = float(pc.get("h24") or 0)
         created = pair.get("pairCreatedAt")
-        if price <= 0 or mc < SUSTAIN_MC_MIN or liq <= 0 or not created:
+        if price <= 0 or liq <= 0 or not created:
             continue
-        # 나이: 초기 펌프 구간을 이미 통과했는가
-        if (now_ms - created) / 3600000 < SUSTAIN_AGE_MIN_H:
-            continue
-        # 거래 활발 (관심이 살아있는가)
-        if (int(txns.get("buys") or 0) + int(txns.get("sells") or 0)) < SUSTAIN_MIN_TXNS:
-            continue
-        # 과열 제외 (급락 리스크 구간은 지속형이 아님)
+        age_h = (now_ms - created) / 3600000
+        ntx = int(txns.get("buys") or 0) + int(txns.get("sells") or 0)
+        # 공통: 과열 아님 + 가격이 무너지지도 폭발하지도 않음 (그라인드 국면)
         if v1 / liq >= SUSTAIN_MAX_HEAT:
             continue
-        # 가격이 '무너지지도, 폭발하지도' 않은 구간
         if not (SUSTAIN_H1_MIN <= h1 <= SUSTAIN_H1_MAX):
             continue
         if h24 < SUSTAIN_H24_MIN:
             continue
-        cands.append((mint, pair, price))
+        # 티어 판정: 엄격(알림) / 조기(관찰만)
+        if mc >= SUSTAIN_MC_MIN and age_h >= SUSTAIN_AGE_MIN_H and ntx >= SUSTAIN_MIN_TXNS:
+            tier = "sustain"
+        elif (SUSTAIN_EARLY_ENABLE and mc >= SUSTAIN_EARLY_MC
+              and age_h >= SUSTAIN_EARLY_AGE_H and ntx >= SUSTAIN_EARLY_TXNS):
+            tier = "sustain_early"
+        else:
+            continue
+        cands.append((mint, pair, price, tier))
     if not cands:
         return
 
     # 중복 등록 방지 확인을 파이프라인 1회로
     cd_load()
     writes = []
-    for (mint, pair, price) in cands:
-        if cd_has("sustain", mint):
+    for (mint, pair, price, tier) in cands:
+        # ★ 쿨다운 키를 티어별로 분리 — 공유하면 조기 티어가 정식 알림을 막아버림
+        if cd_has(tier, mint):
             continue
         sym = (pair.get("baseToken") or {}).get("symbol", "?")
-        cd_set("sustain", mint, SUSTAIN_TTL)
-        perf_add(mint, sym, "sustain", price, pair.get("pairAddress"))
+        cd_set(tier, mint, SUSTAIN_TTL)
+        perf_add(mint, sym, tier, price, pair.get("pairAddress"))
         pc = pair.get("priceChange") or {}
-        if SUSTAIN_ALERT:
-            dangers, warns, top_pct = rugcheck(mint)
-            if dangers:
-                print(f"[SUSTAIN] {sym} RugCheck danger → 알림 스킵")
-                continue
-            send_sustain_alert(pair, warns or 0, top_pct, time.time())
-            r_cmd("INCR", "status:alert_count")
-            r_cmd("SET", "status:last_alert",
-                  f"🌿{sym} @ {datetime.now(timezone.utc).strftime('%m-%d %H:%M')}UTC")
-            tv, _, _ = build_tags(pair, top_pct)
-            archive_alert("sustain", sym, "-", pair, tv)
-            print(f"[SUSTAIN] {sym} 지속형 알림 발송 (1h {pc.get('h1')}% · 24h {pc.get('h24')}%)")
-        else:
-            print(f"[SUSTAIN] {sym} 지속형 관찰등록 (1h {pc.get('h1')}% · 24h {pc.get('h24')}%), 알림없음")
+        accel = vol_accel(pair)
+        atxt = f" · 거래량가속 {accel:.1f}x" if accel else ""
+
+        is_early = (tier == "sustain_early")
+        want = SUSTAIN_EARLY_ALERT if is_early else SUSTAIN_ALERT
+        if not want:
+            print(f"[{tier.upper()}] {sym} 관찰등록 (1h {pc.get('h1')}% · 24h {pc.get('h24')}%{atxt}), 알림없음")
+            continue
+        dangers, warns, top_pct = rugcheck(mint)
+        if dangers:
+            print(f"[{tier.upper()}] {sym} RugCheck danger → 알림 스킵")
+            continue
+        send_sustain_alert(pair, warns or 0, top_pct, time.time(), accel, is_early)
+        icon = "🌱" if is_early else "🌿"
+        r_cmd("INCR", "status:alert_count")
+        r_cmd("SET", "status:last_alert",
+              f"{icon}{sym} @ {datetime.now(timezone.utc).strftime('%m-%d %H:%M')}UTC")
+        tv, _, _ = build_tags(pair, top_pct)
+        archive_alert(tier, sym, "-", pair, tv)
+        print(f"[{tier.upper()}] {sym} 알림 발송 (1h {pc.get('h1')}% · 24h {pc.get('h24')}%{atxt})")
     if writes:
         r_pipe(writes)
 
@@ -1472,7 +1511,7 @@ def check_dip(pair, entry_h1=None):
     return True, reasons, is_veteran
 
 
-def send_sustain_alert(pair, warns, top_holder_pct=None, detect_ts=None):
+def send_sustain_alert(pair, warns, top_holder_pct=None, detect_ts=None, accel=None, is_early=False):
     """지속형 알림 — 폭발형과 성격이 달라 별도 포맷.
     핵심 메시지: 높이 안 가지만 잘 안 무너짐 → 짧게 치고 빠지는 게 아니라 여유 있게."""
     base = pair.get("baseToken") or {}
@@ -1506,11 +1545,17 @@ def send_sustain_alert(pair, warns, top_holder_pct=None, detect_ts=None):
             risk_bits.append("매수착시⚠️")
     risk_line = ("⚠️ " + " · ".join(risk_bits)) if risk_bits else "🟢 주요 위험 신호 없음"
 
+    head_icon = "🌱" if is_early else "🌿"
+    head_tag = "조기 지속형 <i>(미검증)</i>" if is_early else "지속형"
+    guide = ("💡 완만한 흐름 초기 — <b>검증 전 신호</b>, 소액·관찰 위주"
+             if is_early else "💡 급등 아님 — 안 무너지는 흐름. 급하게 안 쫓아도 됨")
     msg = (
-        f"🌿 <b>{name} (${sym})</b>  지속형\n"
+        f"{head_icon} <b>{name} (${sym})</b>  {head_tag}\n"
         f"{{DELAY}} · 1h {pc.get('h1','?')}% · 24h {pc.get('h24','?')}% · {age} · 시총 {mc_txt}\n"
         f"{risk_line}\n"
-        f"💡 급등 아님 — 안 무너지는 흐름. 급하게 안 쫓아도 됨\n"
+        f"{guide}\n"
+        + (f"🔥 거래량 가속 {accel}x (6h평균 대비) — 매집 가능성\n" if accel else "")
+        + 
         f"💰 ${price} · 💧{liq} · 거래량 {v1}\n"
         f"📊 매수/매도 {txns.get('buys','?')}/{txns.get('sells','?')}(건수)\n"
         f"<code>{mint}</code>\n"

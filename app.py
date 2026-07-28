@@ -36,6 +36,7 @@ def r_status():
         cmds.append(["GET", "perf:summary_doubledip"])
         cmds.append(["GET", "perf:summary_sustain"])
         cmds.append(["GET", "perf:summary_cgrade"])
+        cmds.append(["GET", "perf:summary_sustain_early"])
         cmds.append(["GET", "mkt:activity"])
         cmds.append(["GET", "trades:summary"])
         cmds.append(["LRANGE", "trades:done", 0, 4])
@@ -65,14 +66,15 @@ def r_status():
         d["ddsum"] = vals[11] if len(vals) > 11 else None
         d["susum"] = vals[12] if len(vals) > 12 else None
         d["cgsum"] = vals[13] if len(vals) > 13 else None
-        d["mktact"] = vals[14] if len(vals) > 14 else None
-        d["tradesum"] = vals[15] if len(vals) > 15 else None
-        d["trades"] = vals[16] if len(vals) > 16 and vals[16] else []
+        d["sesum"] = vals[14] if len(vals) > 14 else None
+        d["mktact"] = vals[15] if len(vals) > 15 else None
+        d["tradesum"] = vals[16] if len(vals) > 16 else None
+        d["trades"] = vals[17] if len(vals) > 17 and vals[17] else []
         return d
     except Exception:
         return {k: None for k in get_keys} | {"history": [], "archive": [], "possnap": None,
                                               "perfsum": None, "shadowsum": None, "ddsum": None,
-                                              "susum": None, "cgsum": None, "mktact": None,
+                                              "susum": None, "cgsum": None, "sesum": None, "mktact": None,
                                               "tradesum": None, "trades": []}
 
 
@@ -204,10 +206,10 @@ def status():
         try:
             parts = rec.split("|")
             kind, sym, score, verdict, change, ts = parts[:6]
-            icon = {"pump":"🚨","dip":"🎯","sustain":"🌿"}.get(kind,"🚨")
+            icon = {"pump":"🚨","dip":"🎯","sustain":"🌿","sustain_early":"🌱"}.get(kind,"🚨")
             if kind == "pump":
                 pump_ct += 1
-            elif kind == "sustain":
+            elif kind in ("sustain", "sustain_early"):
                 su_ct += 1
             else:
                 dip_ct += 1
@@ -377,6 +379,33 @@ def status():
         su_block = (f"<div class='row'><span class='k'>🌿 지속형 관찰:</span> 수집 중 "
                     f"<span style='color:#aaa;font-size:0.8em'>(폭발형 대조군, 알림 없음)</span></div>")
 
+    # 🌱 조기 지속형 (문턱 완화 · 관찰만)
+    se_block = ""
+    try:
+        ses = json.loads(d.get("sesum") or "{}")
+    except Exception:
+        ses = {}
+    if ses.get("n"):
+        cmp_txt = ""
+        if sus.get("surv_pct") is not None and ses.get("surv_pct") is not None:
+            gap = ses["surv_pct"] - sus["surv_pct"]
+            gc = "#2ecc71" if gap > 5 else ("#e74c3c" if gap < -5 else "#888")
+            cmp_txt = f" <span style='color:{gc}'>(정식 지속형 대비 {gap:+.0f}%p)</span>"
+        se_block = (
+            f"<div class='chart'><div class='k' style='font-size:0.9em;margin-bottom:8px'>"
+            f"🌱 조기 지속형 (완료 {ses['n']}건 · <b style='color:#f39c12'>알림중·미검증</b>)</div>"
+            f"<div style='font-size:1.05em;margin-bottom:6px'>24h 생존율: "
+            f"<b>{ses.get('surv_pct','?')}%</b>{cmp_txt} · 붕괴 {ses.get('crash_pct','?')}%</div>"
+            f"<div style='font-size:0.88em;color:#555'>"
+            f"최저점 중앙 {ses.get('med_trough','?')}% · 최고점 중앙 {ses.get('med_peak','?')}%</div>"
+            f"<div class='k' style='font-size:0.75em;margin-top:6px'>"
+            f"시총500K+ · 3시간+ · 거래120건+ (정식은 1M·6h·250건) · "
+            f"생존율이 비슷하면 문턱 낮춰 더 일찍 알림 검토</div></div>"
+        )
+    else:
+        se_block = (f"<div class='row'><span class='k'>🌱 조기 지속형:</span> 수집 중 "
+                    f"<span style='color:#aaa;font-size:0.8em'>(문턱완화·미검증, 알림중)</span></div>")
+
     # 🔴 C등급 관찰 (알림 대신 관찰 전환된 것들)
     cg_block = ""
     try:
@@ -484,6 +513,7 @@ def status():
 {shadow_block}
 {dd_block}
 {su_block}
+{se_block}
 {cg_block}
 {trade_block}
 {arch_block}
@@ -559,6 +589,16 @@ DexScreener는 매수/매도 <b>건수만</b> 제공 → 소액매수 다수 vs 
 C등급(👎 주의 = 과열·초저시총·홀더집중 등)은 <b>알림 없이 관찰만</b>.<br>
 근거: 1차 자기교정에서 C등급은 peak +63%로 높지만 1시간 뒤 -27.5%로 최악 (내부자 펌프덤프 프로파일)<br>
 되돌리려면 환경변수 <code>CGRADE_ALERT=1</code></div>
+
+<div style='font-weight:bold;margin:14px 0 6px'>🌱 조기 지속형 <span style='color:#f39c12'>(2026-07-29 · 미검증 알림)</span></div>
+<div style='color:#555'>
+정식 지속형 문턱을 낮춰 더 이른 그라인드 국면을 잡음: 시총 $500K+ · 3시간+ · 거래 120건+<br>
+<b>아직 검증 안 된 신호</b> — 알림에 🌱·(미검증) 표시됨. 소액·관찰 위주로.<br>
+끄려면 <code>SUSTAIN_EARLY_ALERT=0</code></div>
+
+<div style='font-weight:bold;margin:14px 0 6px'>🔥 거래량 가속 (미검증 지표)</div>
+<div style='color:#555'>1h 거래량이 6h 평균의 1.8배 이상이면 표시. 가격은 완만한데 거래량만 붙는 매집 국면 후보.<br>
+조건이 아니라 <b>표시만</b> — 결과 비교 후 판단 예정</div>
 
 <div style='font-weight:bold;margin:14px 0 6px'>🌿 지속형 <span style='color:#2ecc71'>(2026-07-27 정식 알림 승격)</span></div>
 <div style='color:#555'>
