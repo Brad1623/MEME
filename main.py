@@ -74,7 +74,9 @@ SHADOW_TTL     = int(os.getenv("SHADOW_TTL_SEC", "10800"))         # 중복 추�
 # --- 2단 눌림(더블딥) 관찰 트래커 (알림 없이 검증 전용, 2026-07-21) ---
 # 가설: 신생코인이 1차 얕은 눌림(-10%) 후 반등, 다시 2차 깊은 눌림(-30%)이 오면
 #       그 시점이 좋은 진입점이다 — 아직 검증 안 됨, forward-test로 데이터부터 쌓음
-DOUBLEDIP_ENABLE   = os.getenv("DOUBLEDIP_ENABLE", "1") == "1"
+# 2026-07-27 검증 결과: n=53 기준 +10%도달 60%·peak중앙 13.4%·최저점 -80.1%
+#   → 기존 급등/눌림목 대비 우위 없음. 기본 OFF (다시 보려면 1)
+DOUBLEDIP_ENABLE   = os.getenv("DOUBLEDIP_ENABLE", "0") == "1"
 DOUBLEDIP_MC_MIN   = float(os.getenv("DOUBLEDIP_MC_MIN", "500000"))  # 대상 하한: 시총 $500K (전문가 스위트스팟 하한)
 DOUBLEDIP_D1_PCT   = float(os.getenv("DOUBLEDIP_D1_PCT", "10"))      # 1차 눌림: 고점 대비 -10% 이내
 DOUBLEDIP_D2_PCT   = float(os.getenv("DOUBLEDIP_D2_PCT", "30"))      # 2차 눌림: 반등고점 대비 -30% 수준
@@ -512,20 +514,30 @@ def _perf_summarize():
             return a[len(a)//2] if a else None
 
         def summarize(subset):
+            # ★ 풀 오매칭으로 오염된 과거 기록 제외 (코드는 고쳤지만 저장된 데이터는 남아있음)
+            subset = [i for i in subset if i.get("peak", 0) <= PERF_SANITY_MAX_PCT]
             if not subset:
                 return None
             n = len(subset)
             hit10 = sum(1 for i in subset if i.get("peak", 0) >= 10)
             early = sum(1 for i in subset if i.get("early_exit") == "deep_crash")
+            # 생존 지표 — 지속형처럼 '안 무너지는 것'이 강점인 트랙 평가용
+            fin = [i.get("r24") for i in subset if i.get("r24") is not None]
+            surv_pct = round(100 * sum(1 for v in fin if v >= 0) / len(fin)) if fin else None
+            crash_pct = round(100 * sum(1 for v in fin if v <= -80) / len(fin)) if fin else None
             return {
                 "n": n,
                 "hit10_pct": round(hit10 / n * 100),
                 "med_r1": med([i.get("r1") for i in subset]),
                 "med_r6": med([i.get("r6") for i in subset]),
                 "med_r24": med([i.get("r24") for i in subset]),
+                "med_peak": med([i.get("peak") for i in subset]),
                 "avg_peak": round(sum(i.get("peak", 0) for i in subset) / n, 1),
                 "worst": round(min(i.get("trough", 0) for i in subset), 1),
+                "med_trough": med([i.get("trough") for i in subset]),
                 "early_pct": round(early / n * 100),
+                "surv_pct": surv_pct,      # 24h 후 플러스로 남은 비율
+                "crash_pct": crash_pct,    # 24h 후 -80% 이하 붕괴 비율
             }
 
         alert_items = [i for i in items if i.get("kind") in ("pump", "dip")]

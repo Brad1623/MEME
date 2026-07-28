@@ -262,7 +262,8 @@ def status():
             f"<b style='color:{hit_c}'>{ps.get('hit10_pct','?')}%</b></div>"
             f"<div style='font-size:0.88em;color:#555'>"
             f"중앙값 수익 — 1h {fmt(ps.get('med_r1'))} · 6h {fmt(ps.get('med_r6'))} · 24h {fmt(ps.get('med_r24'))}<br>"
-            f"평균 최고점 {fmt(ps.get('avg_peak'))} · 최악 낙폭 {fmt(ps.get('worst'))}</div>"
+            f"최고점 중앙 {fmt(ps.get('med_peak'))} · 최저점 중앙 {fmt(ps.get('med_trough'))}<br>"
+            f"<b>24h 생존 {ps.get('surv_pct','?')}%</b> · 붕괴(-80%↓) {ps.get('crash_pct','?')}%</div>"
             f"<div class='k' style='font-size:0.75em;margin-top:6px'>"
             f"조기종료(-80%↓) {ps.get('early_pct','?')}% · Upstash 절감용, 24h까지 안 기다림</div></div>"
         )
@@ -316,15 +317,14 @@ def status():
             diff2_txt = f" <span style='color:{dc2}'>(정식알림 대비 {diff2:+.0f}%p)</span>"
         dd_block = (
             f"<div class='chart'><div class='k' style='font-size:0.9em;margin-bottom:8px'>"
-            f"🌀 2단눌림 관찰 (완료 {dds['n']}건 · 알림無 · 1차-10%→반등→2차-30% 가설검증)</div>"
+            f"🌀 2단눌림 <span style='color:#e74c3c'>(검증완료·중단)</span> · 최종 {dds['n']}건</div>"
             f"<div style='font-size:1.05em;margin-bottom:6px'>+10% 도달률: <b>{dds.get('hit10_pct','?')}%</b>{diff2_txt}</div>"
             f"<div style='font-size:0.88em;color:#555'>"
             f"평균 최고점 {fmt3(dds.get('avg_peak'))} · 최악낙폭 {fmt3(dds.get('worst'))}</div>"
             f"<div class='k' style='font-size:0.75em;margin-top:6px'>표본 20건+ 쌓이면 판단 · 검증되면 정식 알림 승격 검토</div></div>"
         )
     else:
-        dd_block = (f"<div class='row'><span class='k'>🌀 2단눌림 관찰:</span> 수집 중 "
-                    f"<span style='color:#aaa;font-size:0.8em'>(가설검증용, 알림 없음)</span></div>")
+        dd_block = ""
 
     # 🌿 지속형 관찰 트래커 — 폭발형 급등과 대조군
     su_block = ""
@@ -344,13 +344,16 @@ def status():
             diff3_txt = f" <span style='color:{dc3}'>(정식알림 대비 {diff3:+.0f}%p)</span>"
         su_block = (
             f"<div class='chart'><div class='k' style='font-size:0.9em;margin-bottom:8px'>"
-            f"🌿 지속형 관찰 (완료 {sus['n']}건 · 알림無 · 폭발형 대조군)</div>"
-            f"<div style='font-size:1.05em;margin-bottom:6px'>+10% 도달률: <b>{sus.get('hit10_pct','?')}%</b>{diff3_txt}</div>"
+            f"🌿 지속형 (완료 {sus['n']}건 · <b style='color:#2ecc71'>알림 발송중</b>)</div>"
+            f"<div style='font-size:1.05em;margin-bottom:6px'>24h 생존율: "
+            f"<b style='color:#2ecc71'>{sus.get('surv_pct','?')}%</b>"
+            f" · 붕괴(-80%↓) <b>{sus.get('crash_pct','?')}%</b></div>"
             f"<div style='font-size:0.88em;color:#555'>"
             f"중앙값 — 1h {fmt4(sus.get('med_r1'))} · 6h {fmt4(sus.get('med_r6'))} · 24h {fmt4(sus.get('med_r24'))}<br>"
-            f"평균 최고점 {fmt4(sus.get('avg_peak'))} · 최악낙폭 {fmt4(sus.get('worst'))}</div>"
+            f"최저점 중앙 {fmt4(sus.get('med_trough'))} · +10% 도달 {sus.get('hit10_pct','?')}%{diff3_txt}</div>"
             f"<div class='k' style='font-size:0.75em;margin-top:6px'>"
-            f"시총1M+ · 6시간+ · 거래250건+ · 과열아님 · 1h -10~+50%</div></div>"
+            f"시총1M+ · 6시간+ · 거래250건+ · 과열아님 · 1h -10~+50%<br>"
+            f"<b>강점은 높은 수익이 아니라 안 무너지는 것</b> — 손절에 잘 안 걸림</div></div>"
         )
     else:
         su_block = (f"<div class='row'><span class='k'>🌿 지속형 관찰:</span> 수집 중 "
@@ -545,11 +548,11 @@ C등급(👎 주의 = 과열·초저시총·홀더집중 등)은 <b>알림 없�
 조건: 시총 $1M+ · 나이 6시간+ · 1h거래 250건+ · 과열아님(거래량/유동성 5배↓) · 1h -10~+50% · 24h 0%+<br>
 <b>검증 완료</b>: n=35 기준 24h 플러스 37.1%(vs 나머지 7.9%) · -80%↓ 붕괴 11.4%(vs 74.8%) · 최저점 중앙 -14.6%(vs -82.4%)<br>→ <b>덜 오르지만 안 무너진다</b>가 확인되어 알림 발송 시작. 끄려면 <code>SUSTAIN_ALERT=0</code></div>
 
-<div style='font-weight:bold;margin:14px 0 6px'>🌀 2단눌림 가설 (2026-07-21 관찰 시작)</div>
+<div style='font-weight:bold;margin:14px 0 6px'>🌀 2단눌림 <span style='color:#e74c3c'>(2026-07-27 검증완료·중단)</span></div>
 <div style='color:#555'>
 대상: 시총 $500K+ (전문가 스위트스팟 하한)<br>
 ① 고점 대비 -10% 이내 1차 눌림 → ② 반등 → ③ 반등고점 대비 -30% 2차 눌림 (①→③ 1시간 이내)<br>
-가설: 이 2차 눌림 시점이 좋은 진입점 — <b>아직 미검증, 알림 없이 forward-test 중</b>(위 🌀 항목)</div>
+결과: n=53 · +10%도달 60% · 최고점중앙 13.4% · 최저점중앙 -80.1% · 24h생존 13%<br>→ 기존 급등(생존 5%)·눌림목 대비 <b>의미있는 우위 없음</b>. 관찰 종료.<br>재개하려면 <code>DOUBLEDIP_ENABLE=1</code></div>
 
 <div style='font-weight:bold;margin:14px 0 6px'>🔻 매도 위험도 (포지션 감시 · 100점 만점)</div>
 <table style='width:100%;border-collapse:collapse'>
