@@ -639,6 +639,104 @@ def _perf_summarize():
 
 
 # ============================================================
+# 정산 리포트 (/settle) — kind별 "규칙대로 매매했다면" 기대값 (2026-09-02)
+# ============================================================
+SETTLE_KIND_LABEL = {
+    "pump": "급등(정식)", "dip": "눌림목", "sustain": "지속형",
+    "sustain_early": "조기지속형", "shadow": "섀도우(<20분)",
+    "doubledip": "2단눌림", "cgrade": "C등급관찰",
+}
+SETTLE_ALERT_KINDS = ["pump", "dip", "sustain", "sustain_early"]  # 실제 알림 트랙 = 판정 대상
+
+
+def _settle_kind(items, sl, tp):
+    """한 kind의 완료 기록으로 기대값 계산 (전부 % 단위).
+    규칙A(손절만): trough가 -sl 닿으면 -sl, 아니면 최종수익률 — 기록만으로 확정.
+    규칙B(±기준): 익절/손절 둘다 닿은 건은 순서를 몰라서 비관~낙관 범위."""
+    usable = []
+    for i in items:
+        final = i.get("r24")
+        if final is None:   # 90000초 타임아웃 등으로 r24 없으면 r6→r1 순 대체
+            final = i.get("r6") if i.get("r6") is not None else i.get("r1")
+        if final is None:
+            continue
+        usable.append((float(i.get("trough") or 0), float(i.get("peak") or 0), float(final)))
+    n = len(usable)
+    if n == 0:
+        return None
+    a_res = [(-sl if tr <= -sl else fin) for tr, pk, fin in usable]
+    b_pess, b_opt, ambiguous = [], [], 0
+    for tr, pk, fin in usable:
+        hit_sl, hit_tp = tr <= -sl, pk >= tp
+        if hit_sl and hit_tp:
+            ambiguous += 1; b_pess.append(-sl); b_opt.append(tp)
+        elif hit_tp:
+            b_pess.append(tp); b_opt.append(tp)
+        elif hit_sl:
+            b_pess.append(-sl); b_opt.append(-sl)
+        else:
+            b_pess.append(fin); b_opt.append(fin)
+    return {
+        "n": n,
+        "a_ev": round(sum(a_res) / n, 1),
+        "a_stop_pct": round(sum(1 for tr, _, _ in usable if tr <= -sl) / n * 100),
+        "b_ev_pess": round(sum(b_pess) / n, 1),
+        "b_ev_opt": round(sum(b_opt) / n, 1),
+        "b_ambiguous": ambiguous,
+        "tp_pct": round(sum(1 for _, pk, _ in usable if pk >= tp) / n * 100),
+        "surv_pct": round(sum(1 for *_, fin in usable if fin >= 0) / n * 100),
+    }
+
+
+def _settle_verdict(s):
+    if s is None:
+        return "표본없음"
+    if s["a_ev"] > 0 and s["b_ev_pess"] > 0:
+        return "✅ 유지"
+    if s["a_ev"] > 0:
+        return "🟡 유지(익절규칙 재검토)"
+    if s["n"] < 20:
+        return "⏳ 표본부족 — 관찰 지속"
+    return "🔻 관찰 강등 후보"
+
+
+def settle_report(sl=None, tp=None):
+    """perf:done(최근 200건) 기반 kind별 정산 리포트 문자열."""
+    sl = abs(float(sl)) if sl else SELL_SL_PCT
+    tp = abs(float(tp)) if tp else SELL_TP_PCT
+    raw = r_cmd("LRANGE", "perf:done", 0, 199) or []
+    items = []
+    for x in raw:
+        try:
+            it = json.loads(x)
+            if isinstance(it, dict) and it.get("kind") and (it.get("peak") or 0) <= PERF_SANITY_MAX_PCT:
+                items.append(it)
+        except Exception:
+            pass
+    by_kind = {}
+    for i in items:
+        by_kind.setdefault(i["kind"], []).append(i)
+    lines = [f"📊 <b>정산 리포트</b> — 손절 -{sl:g}% / 익절 +{tp:g}% / 총 {len(items)}건", ""]
+    order = SETTLE_ALERT_KINDS + sorted(k for k in by_kind if k not in SETTLE_ALERT_KINDS)
+    for kind in order:
+        s = _settle_kind(by_kind.get(kind, []), sl, tp)
+        label = SETTLE_KIND_LABEL.get(kind, kind)
+        tag = "" if kind in SETTLE_ALERT_KINDS else " (알림없음)"
+        if s is None:
+            lines.append(f"— <b>{label}</b>{tag}: 기록 없음")
+            continue
+        lines.append(
+            f"— <b>{label}</b>{tag} n={s['n']} → {_settle_verdict(s)}\n"
+            f"   A(손절만) <b>{s['a_ev']:+.1f}%</b>/건 · 손절률 {s['a_stop_pct']}%\n"
+            f"   B(±기준) {s['b_ev_pess']:+.1f}~{s['b_ev_opt']:+.1f}%/건"
+            f" (모호{s['b_ambiguous']}) · 익절도달 {s['tp_pct']}% · 생존 {s['surv_pct']}%")
+    lines.append("")
+    lines.append("※ A는 확정 계산 기준(판정 근거). B 범위는 익절/손절 선후를 기록상 몰라서 생김.")
+    lines.append("※ perf:done 최근 200건 기준. 다른 기준: /settle 25 30")
+    return "\n".join(lines)
+
+
+# ============================================================
 # 텔레그램 명령 수신 (/buy /sell /pos /check)
 # ============================================================
 def handle_command(text):
@@ -651,7 +749,16 @@ def handle_command(text):
                 "/buy 민트 [진입가] [손절%] — 등록·감시 시작 (기본 손절 -" + f"{SELL_SL_PCT:g}" + "%)\n"
                 "/sell 민트 — 감시 종료 + 손익·누적통계\n"
                 "/pos — 보유 포지션 목록\n"
-                "/check 민트 — 즉석 매도판단 리포트")
+                "/check 민트 — 즉석 매도판단 리포트\n"
+                "/settle [손절% 익절%] — kind별 기대값 정산 (기본 ±" + f"{SELL_SL_PCT:g}/{SELL_TP_PCT:g}" + ")")
+
+    if cmd == "/settle":
+        try:
+            sl = parts[1] if len(parts) >= 2 else None
+            tp = parts[2] if len(parts) >= 3 else None
+            return settle_report(sl, tp)
+        except Exception as e:
+            return f"정산 실패: {e}"
 
     if cmd == "/buy":
         if len(parts) < 2:
