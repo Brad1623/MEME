@@ -654,6 +654,7 @@ def _settle_kind(items, sl, tp):
     규칙A(손절만): trough가 -sl 닿으면 -sl, 아니면 최종수익률 — 기록만으로 확정.
     규칙B(±기준): 익절/손절 둘다 닿은 건은 순서를 몰라서 비관~낙관 범위."""
     usable = []
+    r1s = []
     for i in items:
         final = i.get("r24")
         if final is None:   # 90000초 타임아웃 등으로 r24 없으면 r6→r1 순 대체
@@ -661,6 +662,8 @@ def _settle_kind(items, sl, tp):
         if final is None:
             continue
         usable.append((float(i.get("trough") or 0), float(i.get("peak") or 0), float(final)))
+        if i.get("r1") is not None:
+            r1s.append(float(i["r1"]))
     n = len(usable)
     if n == 0:
         return None
@@ -676,6 +679,13 @@ def _settle_kind(items, sl, tp):
             b_pess.append(-sl); b_opt.append(-sl)
         else:
             b_pess.append(fin); b_opt.append(fin)
+    # r1 진단: 진입 1시간 뒤 수익률. 대부분 마이너스면 '진입 즉시 하락'=늦은 진입.
+    med_r1 = None
+    neg_r1_pct = None
+    if r1s:
+        sr = sorted(r1s)
+        med_r1 = round(sr[len(sr) // 2], 1)
+        neg_r1_pct = round(sum(1 for v in r1s if v < 0) / len(r1s) * 100)
     return {
         "n": n,
         "a_ev": round(sum(a_res) / n, 1),
@@ -685,6 +695,8 @@ def _settle_kind(items, sl, tp):
         "b_ambiguous": ambiguous,
         "tp_pct": round(sum(1 for _, pk, _ in usable if pk >= tp) / n * 100),
         "surv_pct": round(sum(1 for *_, fin in usable if fin >= 0) / n * 100),
+        "med_r1": med_r1,
+        "neg_r1_pct": neg_r1_pct,
     }
 
 
@@ -729,7 +741,9 @@ def settle_report(sl=None, tp=None):
             f"— {label}{tag} n={s['n']} → {_settle_verdict(s)}\n"
             f"   A(손절만) {s['a_ev']:+.1f}%/건 · 손절률 {s['a_stop_pct']}%\n"
             f"   B(±기준) {s['b_ev_pess']:+.1f}~{s['b_ev_opt']:+.1f}%/건"
-            f" (모호{s['b_ambiguous']}) · 익절도달 {s['tp_pct']}% · 생존 {s['surv_pct']}%")
+            f" (모호{s['b_ambiguous']}) · 익절도달 {s['tp_pct']}% · 생존 {s['surv_pct']}%\n"
+            f"   1h중앙 {s['med_r1'] if s['med_r1'] is not None else '?'}% · "
+            f"진입후1h하락 {s['neg_r1_pct'] if s['neg_r1_pct'] is not None else '?'}%")
     lines.append("")
     lines.append("※ A는 확정 계산 기준(판정 근거). B 범위는 익절/손절 선후를 기록상 몰라서 생김.")
     lines.append("※ perf:done 최근 200건 기준. 다른 기준: /settle 25 30")
@@ -935,7 +949,7 @@ def tg_poll_loop():
                     elif data.startswith("sold:"):
                         reply = handle_command(f"/sell {data[5:]}")
                     if reply:
-                        tg_send(reply)
+                        tg_send_plain(reply.replace("<b>", "").replace("</b>", ""))
                     continue
 
                 msg = upd.get("message") or {}
@@ -945,10 +959,8 @@ def tg_poll_loop():
                 if text.startswith("/"):
                     reply = handle_command(text)
                     if reply:
-                        # 명령 응답은 HTML 파싱 실패(400) 시 태그 제거하고 평문 재발송
-                        if not tg_send(reply):
-                            plain = reply.replace("<b>", "").replace("</b>", "")
-                            tg_send_plain(plain)
+                        # 명령 응답은 처음부터 평문 발송 — HTML 태그를 안 쓰면 400(파싱오류) 원천 차단
+                        tg_send_plain(reply.replace("<b>", "").replace("</b>", ""))
         except Exception as e:
             print(f"[poller] error: {e}")
         time.sleep(5)
