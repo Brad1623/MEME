@@ -354,12 +354,14 @@ def positions_tick(pairs, activity=1.0):
         pnl_txt = (f"\n💰 진입 ${pos.get('entry'):g} → 현재 ${price:g} (<b>{pnl:+.1f}%</b>)"
                    if pnl is not None else "")
 
-        # 🛑 손절선 알림 (최우선 — 위험도 점수와 무관, 15분 쿨다운)
+        # 🛑 손절선 알림 (최우선 — 절대 손실 기준. 위험도 점수와 무관하게 발송)
+        # 손절선이 뚫린 시점엔 이미 손실 확정이라 위험도 게이지는 의미 없음
+        # → 혼란 방지 위해 위험도 숫자 대신 '손절 우선' 메시지로 표시
         sl = float(pos.get("sl") or SELL_SL_PCT)
         if pnl is not None and pnl <= -sl and not slcd_flags[idx]:
             r_cmd("SETEX", f"slcd:{mint}", SELL_CRASH_CD, "1")
             tg_send(f"🛑 <b>[손절선 도달] {sym}</b>  손절기준 -{sl:g}%{pnl_txt}\n"
-                    f"규칙대로면 지금 정리. 위험도 {score:.0f}/100\n"
+                    f"⚠️ 손실 확정 구간 — 규칙대로면 지금 정리 (위험도 무관)\n"
                     f'📊 <a href="https://dexscreener.com/solana/{pair.get("pairAddress","")}">차트</a>',
                     buttons=[("✅ 매도 완료 (감시종료+기록)", f"sold:{mint}")])
             print(f"[SL] {sym} {pnl:.1f}%")
@@ -642,8 +644,8 @@ def _perf_summarize():
 # 정산 리포트 (/settle) — kind별 "규칙대로 매매했다면" 기대값 (2026-09-02)
 # ============================================================
 SETTLE_KIND_LABEL = {
-    "pump": "급등(정식)", "dip": "눌림목", "sustain": "지속형",
-    "sustain_early": "조기지속형", "shadow": "섀도우(<20분)",
+    "pump": "급등(정식)", "pump_fresh": "급등-필터후(관찰)", "dip": "눌림목",
+    "sustain": "지속형", "sustain_early": "조기지속형", "shadow": "섀도우(<20분)",
     "doubledip": "2단눌림", "cgrade": "C등급관찰",
 }
 SETTLE_ALERT_KINDS = ["pump", "dip", "sustain", "sustain_early"]  # 실제 알림 트랙 = 판정 대상
@@ -1685,8 +1687,8 @@ def send_sustain_alert(pair, warns, top_holder_pct=None, detect_ts=None, accel=N
 
     head_icon = "🌱" if is_early else "🌿"
     head_tag = "조기 지속형 <i>(미검증)</i>" if is_early else "지속형"
-    guide = ("💡 완만한 흐름 초기 — <b>검증 전 신호</b>, 소액·관찰 위주"
-             if is_early else "💡 급등 아님 — 안 무너지는 흐름. 급하게 안 쫓아도 됨")
+    guide = ("💡 완만한 흐름 초기 — <b>검증 전 신호</b>, 소액·관찰 위주 · 며칠 홀딩 말고 단기"
+             if is_early else "💡 급등 아님 — 안 무너지는 흐름이나 정산상 생존율 낮음, 몇 시간 내 정리 권장")
     msg = (
         f"{head_icon} <b>{name} (${sym})</b>  {head_tag}\n"
         f"{{DELAY}} · 1h {pc.get('h1','?')}% · 24h {pc.get('h24','?')}% · {age} · 시총 {mc_txt}\n"
@@ -1741,7 +1743,8 @@ def send_dip_alert(pair, reasons, warns, top_holder_pct=None, detect_ts=None):
     header = (
         f"🎯 <b>{name} (${sym})</b> 눌림목\n"
         f"{{DELAY}} · 5m {pc.get('m5','?')}% · 1h {pc.get('h1','?')}%↑ 중 눌림\n"
-        f"{risk_line}"
+        f"{risk_line}\n"
+        f"⏱ <b>단기 출구</b> — 정산상 눌림목은 며칠 내 소멸. 몇 시간 안에 정리 권장"
     )
 
     detail = (
@@ -2001,7 +2004,8 @@ def send_alert(pair, score, reasons, dangers, warns, top_holder_pct=None, detect
         f"🚨 <b>{name} (${sym})</b>  {grade_dot}<b>{grade}</b>·{score}점\n"
         f"{{DELAY}} · 1h {pc.get('h1','?')}%↑ · 24h {pc.get('h24','?')}%↑ · 나이 {age}\n"
         f"{risk_line}\n"
-        f"💡 {guide}"
+        f"💡 {guide}\n"
+        f"⚡ <b>스캘핑 권장</b> — 정산상 급등은 고점이 초반. 짧게 먹고 나오기, 24h 홀딩 금물"
     )
 
     # 핵심 수치 2줄만 (스포일러 미지원 클라이언트 대응 — 짧게 쳐냄)
@@ -2146,6 +2150,14 @@ def main():
                     g, _ = entry_grade(pair, final_score, top_pct, buyvol)
                     archive_alert("pump", sym, final_score, pair, f"[{g}] {tv or ''}")
                     perf_add(mint, sym, "pump", float(pair.get("priceUsd") or 0), pair.get("pairAddress"))
+                    # ★ 진입필터 검증(관찰전용): '아직 안 과열된' 부분집합만 pump_fresh로도 기록.
+                    #   다음 정산에서 pump(전체) vs pump_fresh(필터후) 기대값 비교 → 늦은진입 가설 확정용.
+                    #   기준: 1h<150% AND 24h<500% (build_insights의 추격위험 문턱과 동일). 알림은 안 막음.
+                    _pc = pair.get("priceChange") or {}
+                    _h1 = float(_pc.get("h1") or 0)
+                    _h24 = float(_pc.get("h24") or 0)
+                    if _h1 < 150 and _h24 < 500:
+                        perf_add(mint, sym, "pump_fresh", float(pair.get("priceUsd") or 0), pair.get("pairAddress"))
                 else:
                     print(f"[ALERT-FAIL] {sym} 발송 실패 — 기록 스킵")
                 # dip 추적 목록에 등록 (이 코인이 나중에 눌리면 눌림목 알림)
