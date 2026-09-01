@@ -716,18 +716,18 @@ def settle_report(sl=None, tp=None):
     by_kind = {}
     for i in items:
         by_kind.setdefault(i["kind"], []).append(i)
-    lines = [f"📊 <b>정산 리포트</b> — 손절 -{sl:g}% / 익절 +{tp:g}% / 총 {len(items)}건", ""]
+    lines = [f"📊 정산 리포트 — 손절 -{sl:g}% / 익절 +{tp:g}% / 총 {len(items)}건", ""]
     order = SETTLE_ALERT_KINDS + sorted(k for k in by_kind if k not in SETTLE_ALERT_KINDS)
     for kind in order:
         s = _settle_kind(by_kind.get(kind, []), sl, tp)
         label = SETTLE_KIND_LABEL.get(kind, kind)
         tag = "" if kind in SETTLE_ALERT_KINDS else " (알림없음)"
         if s is None:
-            lines.append(f"— <b>{label}</b>{tag}: 기록 없음")
+            lines.append(f"— {label}{tag}: 기록 없음")
             continue
         lines.append(
-            f"— <b>{label}</b>{tag} n={s['n']} → {_settle_verdict(s)}\n"
-            f"   A(손절만) <b>{s['a_ev']:+.1f}%</b>/건 · 손절률 {s['a_stop_pct']}%\n"
+            f"— {label}{tag} n={s['n']} → {_settle_verdict(s)}\n"
+            f"   A(손절만) {s['a_ev']:+.1f}%/건 · 손절률 {s['a_stop_pct']}%\n"
             f"   B(±기준) {s['b_ev_pess']:+.1f}~{s['b_ev_opt']:+.1f}%/건"
             f" (모호{s['b_ambiguous']}) · 익절도달 {s['tp_pct']}% · 생존 {s['surv_pct']}%")
     lines.append("")
@@ -945,7 +945,10 @@ def tg_poll_loop():
                 if text.startswith("/"):
                     reply = handle_command(text)
                     if reply:
-                        tg_send(reply)
+                        # 명령 응답은 HTML 파싱 실패(400) 시 태그 제거하고 평문 재발송
+                        if not tg_send(reply):
+                            plain = reply.replace("<b>", "").replace("</b>", "")
+                            tg_send_plain(plain)
         except Exception as e:
             print(f"[poller] error: {e}")
         time.sleep(5)
@@ -1011,6 +1014,22 @@ def tg_send(text, retries=3, detect_ts=None, buttons=None):
             time.sleep(2)
     print("[telegram] 최종 발송 실패")
     return False
+
+
+def tg_send_plain(text):
+    """parse_mode 없이 순수 평문 발송 (HTML 파싱 실패 시 폴백용)."""
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT, "text": text, "disable_web_page_preview": True},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            print(f"[telegram-plain] 실패 status={resp.status_code}: {resp.text[:200]}")
+        return resp.status_code == 200
+    except Exception as e:
+        print(f"[telegram-plain] error: {e}")
+        return False
 
 
 # ============================================================
