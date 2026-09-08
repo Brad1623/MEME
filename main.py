@@ -118,6 +118,7 @@ VOL_ACCEL_RATIO = float(os.getenv("VOL_ACCEL_RATIO", "1.8"))  # 1h 거래량이 
 # 1차 자기교정에서 C등급은 peak +63%로 높지만 r1 -27.5%로 최악 = 내부자 펌프덤프 프로파일.
 # 기본값: 알림 없이 관찰만(kind="cgrade"). 1로 두면 기존처럼 알림 발송.
 CGRADE_ALERT = os.getenv("CGRADE_ALERT", "0") == "1"
+DIP_ALERT    = os.getenv("DIP_ALERT", "1") == "1"      # 0이면 눌림목 관찰만(기록O·알림X) — 9/8 정산 손절률100%로 강등
 
 # --- 금액 기준 매수비율 (GeckoTerminal 체결내역) ---
 # DexScreener txns는 '건수'만 제공 → 소액매수 다수 vs 대형매도 소수를 매수세로 오독 가능.
@@ -563,7 +564,7 @@ def perf_tick(pairs):
     # 갱신은 단일 키 1회 SET으로 (기존: 항목당 SET N회)
     pf_flush()
     if done_push:
-        done_push.append(["LTRIM", "perf:done", 0, 199])
+        done_push.append(["LTRIM", "perf:done", 0, 999])   # 200→1000 (9/8: 200건 캡으로 C등급 기록 유실 확인)
         r_pipe(done_push)
         _perf_summarize()      # 완료분 생겼을 때만 재집계 (LRANGE+SET 절감)
 
@@ -644,7 +645,7 @@ def _perf_summarize():
 # 정산 리포트 (/settle) — kind별 "규칙대로 매매했다면" 기대값 (2026-09-02)
 # ============================================================
 SETTLE_KIND_LABEL = {
-    "pump": "급등(정식)", "pump_fresh": "급등-필터후(관찰)", "dip": "눌림목",
+    "pump": "급등(정식)", "pump_fresh": "급등-안과열(관찰)", "pump_conf": "급등-참여확인(관찰)", "dip": "눌림목",
     "sustain": "지속형", "sustain_early": "조기지속형", "shadow": "섀도우(<20분)",
     "doubledip": "2단눌림", "cgrade": "C등급관찰",
 }
@@ -718,7 +719,7 @@ def settle_report(sl=None, tp=None):
     """perf:done(최근 200건) 기반 kind별 정산 리포트 문자열."""
     sl = abs(float(sl)) if sl else SELL_SL_PCT
     tp = abs(float(tp)) if tp else SELL_TP_PCT
-    raw = r_cmd("LRANGE", "perf:done", 0, 199) or []
+    raw = r_cmd("LRANGE", "perf:done", 0, 999) or []
     items = []
     for x in raw:
         try:
@@ -730,7 +731,7 @@ def settle_report(sl=None, tp=None):
     by_kind = {}
     for i in items:
         by_kind.setdefault(i["kind"], []).append(i)
-    lines = [f"📊 정산 리포트 — 손절 -{sl:g}% / 익절 +{tp:g}% / 총 {len(items)}건", ""]
+    lines = [f"📊 정산 리포트 {datetime.now(timezone.utc).strftime('%m/%d')} — 손절 -{sl:g}% / 익절 +{tp:g}% / 총 {len(items)}건", ""]
     order = SETTLE_ALERT_KINDS + sorted(k for k in by_kind if k not in SETTLE_ALERT_KINDS)
     for kind in order:
         s = _settle_kind(by_kind.get(kind, []), sl, tp)
@@ -748,7 +749,7 @@ def settle_report(sl=None, tp=None):
             f"진입후1h하락 {s['neg_r1_pct'] if s['neg_r1_pct'] is not None else '?'}%")
     lines.append("")
     lines.append("※ A는 확정 계산 기준(판정 근거). B 범위는 익절/손절 선후를 기록상 몰라서 생김.")
-    lines.append("※ perf:done 최근 200건 기준. 다른 기준: /settle 25 30")
+    lines.append("※ perf:done 최근 1000건 기준. 다른 기준: /settle 25 30")
     return "\n".join(lines)
 
 
@@ -1510,6 +1511,19 @@ def vol_accel(pair):
     return round(ratio, 1) if ratio >= VOL_ACCEL_RATIO else None
 
 
+def vol_confirm(pair):
+    """참여 확인 비율 = 최근1h 거래량 / (6h 평균 시간당 거래량).
+    >=1이면 현재 시간대 참여가 최근 평균 이상 = 가격 상승을 거래량이 뒷받침.
+    <1이면 가격은 올랐는데 참여는 식는 중 = 속 빈 상승(약세 다이버전스와 같은 경제학).
+    vol_accel과 달리 임계치 게이트 없이 항상 비율을 반환 (표시·기록용)."""
+    vol = pair.get("volume") or {}
+    v1 = float(vol.get("h1") or 0)
+    v6 = float(vol.get("h6") or 0)
+    if v6 <= 0 or v1 <= 0:
+        return None
+    return round(v1 / (v6 / 6), 2)
+
+
 def sustain_tick(pairs):
     """지속형(sustained) 관찰 트래커 — 알림 없이 perf 등록만, 가설 검증용.
     '폭발형 급등'과 반대 프로파일: 이미 초기 구간을 넘겼고, 과열되지 않았는데
@@ -2006,6 +2020,9 @@ def send_alert(pair, score, reasons, dangers, warns, top_holder_pct=None, detect
         f"{risk_line}\n"
         f"💡 {guide}\n"
         f"⚡ <b>스캘핑 권장</b> — 정산상 급등은 고점이 초반. 짧게 먹고 나오기, 24h 홀딩 금물"
+        + (f"\n{'✅' if (_vc := vol_confirm(pair)) and _vc >= 1 else '⚠️'} 참여확인 {_vc}x"
+           f" ({'거래량이 상승 뒷받침' if _vc and _vc >= 1 else '가격만 오르고 참여는 식는 중'})"
+           if vol_confirm(pair) else "")
     )
 
     # 핵심 수치 2줄만 (스포일러 미지원 클라이언트 대응 — 짧게 쳐냄)
@@ -2158,6 +2175,11 @@ def main():
                     _h24 = float(_pc.get("h24") or 0)
                     if _h1 < 150 and _h24 < 500:
                         perf_add(mint, sym, "pump_fresh", float(pair.get("priceUsd") or 0), pair.get("pairAddress"))
+                    # ★ 참여확인 검증(관찰전용): 거래량이 상승을 뒷받침하는 건만 pump_conf로도 기록.
+                    #   fresh와 독립 축 — 다음 정산에서 pump / pump_fresh / pump_conf 3자 비교.
+                    _vc = vol_confirm(pair)
+                    if _vc is not None and _vc >= 1.0:
+                        perf_add(mint, sym, "pump_conf", float(pair.get("priceUsd") or 0), pair.get("pairAddress"))
                 else:
                     print(f"[ALERT-FAIL] {sym} 발송 실패 — 기록 스킵")
                 # dip 추적 목록에 등록 (이 코인이 나중에 눌리면 눌림목 알림)
@@ -2195,6 +2217,12 @@ def main():
                         cd_set("dip", mint, DIP_COOLDOWN)
                         perf_add(mint, sym, "cgrade", float(pair.get("priceUsd") or 0), pair.get("pairAddress"))
                         print(f"[C-OBS] {sym} 눌림목 C등급 → 관찰만 (알림 없음)")
+                        continue
+                    if not DIP_ALERT:
+                        # 관찰 강등 상태: 알림 없이 perf만 기록 (다음 정산에서 회복 여부 판정용)
+                        cd_set("dip", mint, DIP_COOLDOWN)
+                        perf_add(mint, sym, "dip", float(pair.get("priceUsd") or 0), pair.get("pairAddress"))
+                        print(f"[DIP-OBS] {sym} 눌림목 → 관찰만 (DIP_ALERT=0)")
                         continue
                     dip_ok = send_dip_alert(pair, dip_reasons, warns or 0, top_pct, detect_ts)
                     cd_set("dip", mint, DIP_COOLDOWN)
