@@ -492,7 +492,7 @@ def perf_add(mint, sym, kind, price, pool=None):
     ts = int(time.time())
     key = f"{mint}:{kind}:{ts}"   # kind 포함 — 같은 코인이 여러 트랙에 동시 등록돼도 충돌 없음
     pf_load()[key] = {"mint": mint, "sym": sym, "kind": kind, "ap": price, "ts": ts,
-                      "pool": pool or "", "peak": 0.0, "trough": 0.0,
+                      "pool": pool or "", "peak": 0.0, "trough": 0.0, "tpeak": 0, "ttrough": 0,
                       "r1": None, "r6": None, "r24": None}
     _PF["dirty"] = True
 
@@ -540,6 +540,12 @@ def perf_tick(pairs):
             else:
                 pnl = None
             if pnl is not None:
+                # ★ 9/13: peak/trough 갱신 시각(진입 후 경과초)도 기록.
+                #   정산 규칙B의 '모호' 건(익절·손절 둘 다 닿음)에서 선후를 판정하기 위함.
+                if pnl > it["peak"]:
+                    it["tpeak"] = int(age)
+                if pnl < it["trough"]:
+                    it["ttrough"] = int(age)
                 it["peak"] = round(max(it["peak"], pnl), 1)
                 it["trough"] = round(min(it["trough"], pnl), 1)
                 if it["r1"] is None and age >= 3600:
@@ -664,18 +670,25 @@ def _settle_kind(items, sl, tp):
             final = i.get("r6") if i.get("r6") is not None else i.get("r1")
         if final is None:
             continue
-        usable.append((float(i.get("trough") or 0), float(i.get("peak") or 0), float(final)))
+        usable.append((float(i.get("trough") or 0), float(i.get("peak") or 0), float(final),
+                       i.get("tpeak"), i.get("ttrough")))
         if i.get("r1") is not None:
             r1s.append(float(i["r1"]))
     n = len(usable)
     if n == 0:
         return None
-    a_res = [(-sl if tr <= -sl else fin) for tr, pk, fin in usable]
-    b_pess, b_opt, ambiguous = [], [], 0
-    for tr, pk, fin in usable:
+    a_res = [(-sl if tr <= -sl else fin) for tr, pk, _f, _tp, _tt in usable]
+    b_pess, b_opt, ambiguous, resolved = [], [], 0, 0
+    for tr, pk, fin, t_pk, t_tr in usable:
         hit_sl, hit_tp = tr <= -sl, pk >= tp
         if hit_sl and hit_tp:
-            ambiguous += 1; b_pess.append(-sl); b_opt.append(tp)
+            # 시각 기록이 있으면 먼저 닿은 쪽으로 확정 (구 기록엔 없어서 그때만 범위 유지)
+            if t_pk and t_tr:
+                resolved += 1
+                first = tp if t_pk < t_tr else -sl
+                b_pess.append(first); b_opt.append(first)
+            else:
+                ambiguous += 1; b_pess.append(-sl); b_opt.append(tp)
         elif hit_tp:
             b_pess.append(tp); b_opt.append(tp)
         elif hit_sl:
@@ -692,12 +705,13 @@ def _settle_kind(items, sl, tp):
     return {
         "n": n,
         "a_ev": round(sum(a_res) / n, 1),
-        "a_stop_pct": round(sum(1 for tr, _, _ in usable if tr <= -sl) / n * 100),
+        "a_stop_pct": round(sum(1 for u in usable if u[0] <= -sl) / n * 100),
         "b_ev_pess": round(sum(b_pess) / n, 1),
         "b_ev_opt": round(sum(b_opt) / n, 1),
         "b_ambiguous": ambiguous,
-        "tp_pct": round(sum(1 for _, pk, _ in usable if pk >= tp) / n * 100),
-        "surv_pct": round(sum(1 for *_, fin in usable if fin >= 0) / n * 100),
+        "b_resolved": resolved,
+        "tp_pct": round(sum(1 for u in usable if u[1] >= tp) / n * 100),
+        "surv_pct": round(sum(1 for u in usable if u[2] >= 0) / n * 100),
         "med_r1": med_r1,
         "neg_r1_pct": neg_r1_pct,
     }
@@ -744,7 +758,7 @@ def settle_report(sl=None, tp=None):
             f"— {label}{tag} n={s['n']} → {_settle_verdict(s)}\n"
             f"   A(손절만) {s['a_ev']:+.1f}%/건 · 손절률 {s['a_stop_pct']}%\n"
             f"   B(±기준) {s['b_ev_pess']:+.1f}~{s['b_ev_opt']:+.1f}%/건"
-            f" (모호{s['b_ambiguous']}) · 익절도달 {s['tp_pct']}% · 생존 {s['surv_pct']}%\n"
+            f" (모호{s['b_ambiguous']}/확정{s['b_resolved']}) · 익절도달 {s['tp_pct']}% · 생존 {s['surv_pct']}%\n"
             f"   1h중앙 {s['med_r1'] if s['med_r1'] is not None else '?'}% · "
             f"진입후1h하락 {s['neg_r1_pct'] if s['neg_r1_pct'] is not None else '?'}%")
     lines.append("")
