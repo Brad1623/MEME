@@ -677,7 +677,7 @@ def _settle_kind(items, sl, tp):
     n = len(usable)
     if n == 0:
         return None
-    a_res = [(-sl if tr <= -sl else fin) for tr, pk, _f, _tp, _tt in usable]
+    a_res = [(-sl if tr <= -sl else fin) for tr, _pk, fin, _tp, _tt in usable]
     b_pess, b_opt, ambiguous, resolved = [], [], 0, 0
     for tr, pk, fin, t_pk, t_tr in usable:
         hit_sl, hit_tp = tr <= -sl, pk >= tp
