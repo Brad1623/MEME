@@ -117,6 +117,8 @@ VOL_ACCEL_RATIO = float(os.getenv("VOL_ACCEL_RATIO", "1.8"))  # 1h 거래량이 
 # --- C등급 처리 (2026-07-24) ---
 # 1차 자기교정에서 C등급은 peak +63%로 높지만 r1 -27.5%로 최악 = 내부자 펌프덤프 프로파일.
 # 기본값: 알림 없이 관찰만(kind="cgrade"). 1로 두면 기존처럼 알림 발송.
+CROSS_LADDER = (-50, -40, -30, -25, -20, -15, -10, -5, 5, 10, 15, 20, 25, 30, 40, 50)
+BUILD_VERSION = "2026-09-20a"   # 배포 반영 여부 확인용 — 코드 고칠 때마다 갱신
 CGRADE_ALERT = os.getenv("CGRADE_ALERT", "0") == "1"
 DIP_ALERT    = os.getenv("DIP_ALERT", "1") == "1"      # 0이면 눌림목 관찰만(기록O·알림X) — 9/8 정산 손절률100%로 강등
 
@@ -492,7 +494,7 @@ def perf_add(mint, sym, kind, price, pool=None):
     ts = int(time.time())
     key = f"{mint}:{kind}:{ts}"   # kind 포함 — 같은 코인이 여러 트랙에 동시 등록돼도 충돌 없음
     pf_load()[key] = {"mint": mint, "sym": sym, "kind": kind, "ap": price, "ts": ts,
-                      "pool": pool or "", "peak": 0.0, "trough": 0.0, "tpeak": 0, "ttrough": 0,
+                      "pool": pool or "", "peak": 0.0, "trough": 0.0, "tpeak": 0, "ttrough": 0, "cross": {},
                       "r1": None, "r6": None, "r24": None}
     _PF["dirty"] = True
 
@@ -546,6 +548,15 @@ def perf_tick(pairs):
                     it["tpeak"] = int(age)
                 if pnl < it["trough"]:
                     it["ttrough"] = int(age)
+                # ★ 9/20: 각 임계선을 '처음 넘은' 시각 기록.
+                #   tpeak/ttrough는 최고·최저 '시각'이라 끝에서 붕괴하는 코인은
+                #   ttrough가 무조건 늦게 잡혀 '익절 먼저'로 과대판정되는 편향이 있음.
+                #   최초 돌파 시각을 직접 남기면 선후를 편향 없이 확정 가능.
+                xs = it.setdefault("cross", {})
+                for th in CROSS_LADDER:
+                    k = str(th)
+                    if k not in xs and ((th > 0 and pnl >= th) or (th < 0 and pnl <= th)):
+                        xs[k] = int(age)
                 it["peak"] = round(max(it["peak"], pnl), 1)
                 it["trough"] = round(min(it["trough"], pnl), 1)
                 if it["r1"] is None and age >= 3600:
@@ -671,20 +682,26 @@ def _settle_kind(items, sl, tp):
         if final is None:
             continue
         usable.append((float(i.get("trough") or 0), float(i.get("peak") or 0), float(final),
-                       i.get("tpeak"), i.get("ttrough")))
+                       i.get("tpeak"), i.get("ttrough"), i.get("cross") or {}))
         if i.get("r1") is not None:
             r1s.append(float(i["r1"]))
     n = len(usable)
     if n == 0:
         return None
-    a_res = [(-sl if tr <= -sl else fin) for tr, _pk, fin, _tp, _tt in usable]
-    b_pess, b_opt, ambiguous, resolved = [], [], 0, 0
-    for tr, pk, fin, t_pk, t_tr in usable:
+    a_res = [(-sl if tr <= -sl else fin) for tr, _pk, fin, _tp, _tt, _cx in usable]
+    b_pess, b_opt, ambiguous, approx, exact = [], [], 0, 0, 0
+    for tr, pk, fin, t_pk, t_tr, cx in usable:
         hit_sl, hit_tp = tr <= -sl, pk >= tp
         if hit_sl and hit_tp:
-            # 시각 기록이 있으면 먼저 닿은 쪽으로 확정 (구 기록엔 없어서 그때만 범위 유지)
-            if t_pk and t_tr:
-                resolved += 1
+            # 1순위: 해당 임계선을 '처음 넘은' 시각이 둘 다 있으면 편향 없이 확정
+            c_tp, c_sl = cx.get(str(int(tp))), cx.get(str(int(-sl)))
+            if c_tp and c_sl:
+                exact += 1
+                first = tp if c_tp < c_sl else -sl
+                b_pess.append(first); b_opt.append(first)
+            # 2순위: 최고·최저 시각으로 근사 (익절먼저 쪽으로 치우침 — 낙관 편향)
+            elif t_pk and t_tr:
+                approx += 1
                 first = tp if t_pk < t_tr else -sl
                 b_pess.append(first); b_opt.append(first)
             else:
@@ -709,7 +726,8 @@ def _settle_kind(items, sl, tp):
         "b_ev_pess": round(sum(b_pess) / n, 1),
         "b_ev_opt": round(sum(b_opt) / n, 1),
         "b_ambiguous": ambiguous,
-        "b_resolved": resolved,
+        "b_approx": approx,
+        "b_exact": exact,
         "tp_pct": round(sum(1 for u in usable if u[1] >= tp) / n * 100),
         "surv_pct": round(sum(1 for u in usable if u[2] >= 0) / n * 100),
         "med_r1": med_r1,
@@ -745,7 +763,7 @@ def settle_report(sl=None, tp=None):
     by_kind = {}
     for i in items:
         by_kind.setdefault(i["kind"], []).append(i)
-    lines = [f"📊 정산 리포트 {datetime.now(timezone.utc).strftime('%m/%d')} — 손절 -{sl:g}% / 익절 +{tp:g}% / 총 {len(items)}건", ""]
+    lines = [f"📊 정산 리포트 {datetime.now(timezone.utc).strftime('%m/%d')} (빌드 {BUILD_VERSION}) — 손절 -{sl:g}% / 익절 +{tp:g}% / 총 {len(items)}건", ""]
     order = SETTLE_ALERT_KINDS + sorted(k for k in by_kind if k not in SETTLE_ALERT_KINDS)
     for kind in order:
         s = _settle_kind(by_kind.get(kind, []), sl, tp)
@@ -758,11 +776,12 @@ def settle_report(sl=None, tp=None):
             f"— {label}{tag} n={s['n']} → {_settle_verdict(s)}\n"
             f"   A(손절만) {s['a_ev']:+.1f}%/건 · 손절률 {s['a_stop_pct']}%\n"
             f"   B(±기준) {s['b_ev_pess']:+.1f}~{s['b_ev_opt']:+.1f}%/건"
-            f" (모호{s['b_ambiguous']}/확정{s['b_resolved']}) · 익절도달 {s['tp_pct']}% · 생존 {s['surv_pct']}%\n"
+            f" (모호{s['b_ambiguous']}/근사{s['b_approx']}/정밀{s['b_exact']}) · 익절도달 {s['tp_pct']}% · 생존 {s['surv_pct']}%\n"
             f"   1h중앙 {s['med_r1'] if s['med_r1'] is not None else '?'}% · "
             f"진입후1h하락 {s['neg_r1_pct'] if s['neg_r1_pct'] is not None else '?'}%")
     lines.append("")
     lines.append("※ A는 확정 계산 기준(판정 근거). B 범위는 익절/손절 선후를 기록상 몰라서 생김.")
+    lines.append("※ 근사=최고·최저 시각 기준(익절먼저로 치우침) / 정밀=임계선 최초돌파 기준(편향없음).")
     lines.append("※ perf:done 최근 1000건 기준. 다른 기준: /settle 25 30")
     return "\n".join(lines)
 
@@ -2064,7 +2083,7 @@ def main():
     # 가동 메시지는 하루 1회만 (무료 티어 슬립/재시작 반복 시 스팸 방지)
     if not r_cmd("GET", "boot_notified"):
         tg_send(
-            "🤖 <b>Solana Meme Screener v1.0 가동</b>\n"
+            f"🤖 <b>Solana Meme Screener 가동</b> (빌드 {BUILD_VERSION})\n"
             f"스캔주기 {LOOP_SEC}s · 알림점수 ≥{ALERT_SCORE} · 최소유동성 {fmt_usd(MIN_LIQ_USD)}\n"
             "소스: DexScreener + GeckoTerminal + RugCheck"
         )
