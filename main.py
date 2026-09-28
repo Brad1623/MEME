@@ -118,7 +118,7 @@ VOL_ACCEL_RATIO = float(os.getenv("VOL_ACCEL_RATIO", "1.8"))  # 1h 거래량이 
 # 1차 자기교정에서 C등급은 peak +63%로 높지만 r1 -27.5%로 최악 = 내부자 펌프덤프 프로파일.
 # 기본값: 알림 없이 관찰만(kind="cgrade"). 1로 두면 기존처럼 알림 발송.
 CROSS_LADDER = (-50, -40, -30, -25, -20, -15, -10, -5, 5, 10, 15, 20, 25, 30, 40, 50)
-BUILD_VERSION = "2026-09-20a"   # 배포 반영 여부 확인용 — 코드 고칠 때마다 갱신
+BUILD_VERSION = "2026-09-28a"   # 배포 반영 여부 확인용 — 코드 고칠 때마다 갱신
 CGRADE_ALERT = os.getenv("CGRADE_ALERT", "0") == "1"
 DIP_ALERT    = os.getenv("DIP_ALERT", "1") == "1"      # 0이면 눌림목 관찰만(기록O·알림X) — 9/8 정산 손절률100%로 강등
 
@@ -166,6 +166,16 @@ RUG_BASE   = "https://api.rugcheck.xyz/v1"
 # ============================================================
 # Upstash Redis REST 헬퍼
 # ============================================================
+_R_ERR_LOG = {"ts": 0}
+
+
+def _r_log_err(msg):
+    """Redis 오류 로그 — 한도초과 시 사이클마다 수백 줄 쏟아지지 않게 1분 1회로 제한."""
+    if time.time() - _R_ERR_LOG["ts"] > 60:
+        _R_ERR_LOG["ts"] = time.time()
+        print(f"[redis] {msg}")
+
+
 def r_cmd(*args):
     """Upstash REST로 Redis 명령 실행. 실패 시 None (봇은 계속 동작)."""
     try:
@@ -175,10 +185,33 @@ def r_cmd(*args):
             json=[str(a) for a in args],
             timeout=10,
         )
-        return resp.json().get("result")
+        j = resp.json()
+        if isinstance(j, dict) and "error" in j:
+            _r_log_err(f"오류 응답 ({args[0]}): {str(j['error'])[:120]}")
+            return None
+        return j.get("result")
     except Exception as e:
-        print(f"[redis] error: {e}")
+        _r_log_err(f"error: {e}")
         return None
+
+
+def _r_get_ok(key):
+    """(성공여부, 값). '키 없음'(성공, None)과 '요청 실패/한도초과'(실패)를 구분.
+    9/28 한도초과 사고 대응 — 실패를 '빈 데이터'로 오인해 덮어쓰는 걸 막기 위함."""
+    try:
+        resp = requests.post(
+            UPSTASH_URL,
+            headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
+            json=["GET", key], timeout=10,
+        )
+        j = resp.json()
+        if isinstance(j, dict) and "error" in j:
+            _r_log_err(f"GET {key} 실패: {str(j['error'])[:120]}")
+            return False, None
+        return True, j.get("result")
+    except Exception as e:
+        _r_log_err(f"GET {key} error: {e}")
+        return False, None
 
 
 def r_pipe(commands):
@@ -428,7 +461,8 @@ _PF = {"data": None, "dirty": False}      # 성과추적 통합: {key: item}
 def cd_load():
     """쿨다운 맵 로드 (사이클당 1회). 만료분은 로드 시 정리."""
     if _CD["data"] is None:
-        raw = r_cmd("GET", "cd:all")
+        ok, raw = _r_get_ok("cd:all")
+        _CD["synced"] = ok   # False = Redis 원본을 못 읽음 → flush 전에 병합 필요
         try:
             d = json.loads(raw) if raw else {}
         except Exception:
@@ -463,6 +497,19 @@ def cd_val(kind, mint):
 
 def cd_flush():
     if _CD["dirty"] and _CD["data"] is not None:
+        if not _CD.get("synced", True):
+            ok, raw = _r_get_ok("cd:all")
+            if not ok:
+                return   # 아직 Redis 불가 — 메모리 유지, 원본 덮어쓰기 금지
+            try:
+                remote = json.loads(raw) if raw else {}
+            except Exception:
+                remote = {}
+            for k, v in remote.items():   # 같은 키는 만료가 늦은 쪽 채택
+                if k not in _CD["data"] or _cd_exp(v) > _cd_exp(_CD["data"][k]):
+                    _CD["data"][k] = v
+            _CD["synced"] = True
+            print(f"[redis] cd:all 복구 병합 완료 ({len(remote)}건)")
         r_cmd("SET", "cd:all", json.dumps(_CD["data"]))
         _CD["dirty"] = False
 
@@ -470,7 +517,8 @@ def cd_flush():
 def pf_load():
     """성과추적 맵 로드 (틱당 1회)."""
     if _PF["data"] is None:
-        raw = r_cmd("GET", "perf:active")
+        ok, raw = _r_get_ok("perf:active")
+        _PF["synced"] = ok
         try:
             _PF["data"] = json.loads(raw) if raw else {}
         except Exception:
@@ -480,6 +528,18 @@ def pf_load():
 
 def pf_flush():
     if _PF["dirty"] and _PF["data"] is not None:
+        if not _PF.get("synced", True):
+            ok, raw = _r_get_ok("perf:active")
+            if not ok:
+                return   # 아직 Redis 불가 — 추적중 기록 덮어쓰기 금지
+            try:
+                remote = json.loads(raw) if raw else {}
+            except Exception:
+                remote = {}
+            for k, v in remote.items():   # 키가 mint:kind:ts로 유일 → 메모리에 없는 것만 복원
+                _PF["data"].setdefault(k, v)
+            _PF["synced"] = True
+            print(f"[redis] perf:active 복구 병합 완료 ({len(remote)}건)")
         r_cmd("SET", "perf:active", json.dumps(_PF["data"]))
         _PF["dirty"] = False
 
@@ -949,12 +1009,16 @@ _POLLER_STARTED = False
 def tg_poll_loop():
     """텔레그램 명령 폴러 (5초 주기, 별도 스레드)."""
     print("[poller] telegram command poller started")
+    # ★ 9/28: offset은 기동 시 1회만 Redis에서 읽고 이후 메모리 유지.
+    #   기존엔 5초마다 GET → 하루 17,280회 = 월 52만 회로 이것만으로 무료한도(50만) 초과.
+    #   이제 Redis 접근은 명령이 실제로 도착했을 때 SET 1회뿐.
+    _ok, _off = _r_get_ok("tg:offset")
+    offset = int(_off) if (_ok and _off) else None
     while True:
         try:
             params = {"timeout": 0}
-            off = r_cmd("GET", "tg:offset")
-            if off:
-                params["offset"] = int(off) + 1
+            if offset is not None:
+                params["offset"] = offset + 1
             resp = requests.get(
                 f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates",
                 params=params, timeout=10,
@@ -963,7 +1027,8 @@ def tg_poll_loop():
                 time.sleep(10)  # 배포 교체 중 이중 폴링 충돌 → 대기
                 continue
             for upd in (resp.json().get("result") or []):
-                r_cmd("SET", "tg:offset", upd["update_id"])
+                offset = upd["update_id"]
+                r_cmd("SET", "tg:offset", offset)   # 명령 도착 시에만 (재시작 대비 영속화)
 
                 # 버튼 클릭 (callback_query) 처리
                 cq = upd.get("callback_query")
