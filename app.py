@@ -125,6 +125,11 @@ def start_once():
 # gunicorn이 모듈을 import하는 시점에 기동
 start_once()
 
+# 펀딩비 숏쏠림 롱 봇 (페이퍼) — 별도 스레드, 스크리너와 독립. /fr/status 로 확인
+import funding_bot
+funding_bot.start()
+app.register_blueprint(funding_bot.fr_bp)
+
 
 @app.route("/")
 def health():
