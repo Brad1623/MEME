@@ -19,63 +19,62 @@ _worker = None          # 현재 스크리너 스레드 핸들
 _watchdog_started = False
 
 
+_STATUS_CACHE = {"ts": 0.0, "ttl": 0, "vals": None}
+
+
 def r_status():
-    """status 표시용 데이터를 파이프라인 1회로 모두 읽기.
-    GET 6개 + 히스토리 LRANGE 1개. 타임아웃 짧게 → 워커 안 막음."""
+    """status 표시용 데이터.
+    ★ 2026-10-22 Upstash 절감: 매 사이클 바뀌는 값(status:main, 흐름, 포지션 스냅샷, 시장활성도)은
+      screener 메모리(MEM)에서 바로 읽음 → Redis 0회.
+      나머지(알림 기록·성과 요약·실거래)는 Redis에서 읽되 10분 캐시
+      (기존: 30초 자동새로고침마다 19커맨드 → 탭 열어두면 하루 5만+)."""
     get_keys = [
         "status:main", "status:candidates", "status:last_scan",
         "status:alert_count", "status:last_alert", "status:restart_count",
     ]
-    try:
-        cmds = [["GET", k] for k in get_keys]
-        cmds.append(["LRANGE", "status:history", 0, 19])
-        cmds.append(["LRANGE", "archive:alerts", 0, 29])
-        cmds.append(["GET", "pos:snapshot"])
-        cmds.append(["GET", "perf:summary"])
-        cmds.append(["GET", "perf:summary_shadow"])
-        cmds.append(["GET", "perf:summary_doubledip"])
-        cmds.append(["GET", "perf:summary_sustain"])
-        cmds.append(["GET", "perf:summary_cgrade"])
-        cmds.append(["GET", "perf:summary_sustain_early"])
-        cmds.append(["GET", "mkt:activity"])
-        cmds.append(["GET", "trades:summary"])
-        cmds.append(["LRANGE", "trades:done", 0, 4])
-        resp = requests.post(
-            screener.UPSTASH_URL + "/pipeline",
-            headers={"Authorization": f"Bearer {screener.UPSTASH_TOKEN}"},
-            json=cmds,
-            timeout=3,
-        )
-        results = resp.json()
-        vals = [r.get("result") if isinstance(r, dict) else None for r in results]
-        d = dict(zip(get_keys, vals[:6]))
-        # status:main(통합 JSON) → 기존 개별 필드로 펼침 (커맨드 절감 대응)
+    c = _STATUS_CACHE
+    if c["vals"] is None or time.time() - c["ts"] > c["ttl"]:
+        cmds = [["GET", "status:alert_count"], ["GET", "status:last_alert"], ["GET", "status:restart_count"],
+                ["LRANGE", "archive:alerts", 0, 29],
+                ["GET", "perf:summary"], ["GET", "perf:summary_shadow"], ["GET", "perf:summary_doubledip"],
+                ["GET", "perf:summary_sustain"], ["GET", "perf:summary_cgrade"],
+                ["GET", "perf:summary_sustain_early"],
+                ["GET", "trades:summary"], ["LRANGE", "trades:done", 0, 4]]
         try:
-            main = json.loads(d.get("status:main") or "{}")
+            resp = requests.post(
+                screener.UPSTASH_URL + "/pipeline",
+                headers={"Authorization": f"Bearer {screener.UPSTASH_TOKEN}"},
+                json=cmds, timeout=3,
+            )
+            out = resp.json()
+            vals = [r.get("result") if isinstance(r, dict) else None for r in out]
+            ok = isinstance(out, list) and not any(isinstance(r, dict) and "error" in r for r in out)
         except Exception:
-            main = {}
-        if main:
-            d["status:cycle"] = main.get("cycle")
-            d["status:candidates"] = main.get("candidates")
-            d["status:last_scan"] = main.get("last_scan")
-        d["history"] = vals[6] if len(vals) > 6 and vals[6] else []
-        d["archive"] = vals[7] if len(vals) > 7 and vals[7] else []
-        d["possnap"] = vals[8] if len(vals) > 8 else None
-        d["perfsum"] = vals[9] if len(vals) > 9 else None
-        d["shadowsum"] = vals[10] if len(vals) > 10 else None
-        d["ddsum"] = vals[11] if len(vals) > 11 else None
-        d["susum"] = vals[12] if len(vals) > 12 else None
-        d["cgsum"] = vals[13] if len(vals) > 13 else None
-        d["sesum"] = vals[14] if len(vals) > 14 else None
-        d["mktact"] = vals[15] if len(vals) > 15 else None
-        d["tradesum"] = vals[16] if len(vals) > 16 else None
-        d["trades"] = vals[17] if len(vals) > 17 and vals[17] else []
-        return d
+            vals, ok = [None] * len(cmds), False
+        if ok or c["vals"] is None:
+            c["vals"] = vals
+        c["ts"] = time.time()
+        c["ttl"] = 600 if ok else 120      # 실패(한도초과 등) 시에도 2분간은 재시도 안 함
+    v = c["vals"]
+    M = screener.MEM
+    d = {"status:main": M.get("status:main"), "status:candidates": None, "status:last_scan": None,
+         "status:alert_count": v[0], "status:last_alert": v[1], "status:restart_count": v[2]}
+    try:
+        main = json.loads(d["status:main"] or "{}")
     except Exception:
-        return {k: None for k in get_keys} | {"history": [], "archive": [], "possnap": None,
-                                              "perfsum": None, "shadowsum": None, "ddsum": None,
-                                              "susum": None, "cgsum": None, "sesum": None, "mktact": None,
-                                              "tradesum": None, "trades": []}
+        main = {}
+    if main:
+        d["status:cycle"] = main.get("cycle")
+        d["status:candidates"] = main.get("candidates")
+        d["status:last_scan"] = main.get("last_scan")
+    d["history"] = list(M.get("status:history") or [])
+    d["archive"] = v[3] or []
+    d["possnap"] = M.get("pos:snapshot")
+    d["perfsum"], d["shadowsum"], d["ddsum"], d["susum"], d["cgsum"], d["sesum"] = v[4:10]
+    d["mktact"] = M.get("mkt:activity")
+    d["tradesum"] = v[10]
+    d["trades"] = v[11] or []
+    return d
 
 
 def _spawn_worker():
@@ -491,7 +490,7 @@ def status():
                        f"<span style='color:#aaa;font-size:0.8em'>(/sell 시 자동 저장)</span></div>")
 
     html = f"""<html><head><meta charset='utf-8'>
-<meta http-equiv='refresh' content='30'>
+<meta http-equiv='refresh' content='60'>
 <title>Meme Screener 상태</title>
 <style>body{{font-family:-apple-system,sans-serif;max-width:500px;margin:40px auto;padding:0 20px;line-height:1.8}}
 .big{{font-size:1.3em;font-weight:bold;margin:20px 0;padding:15px;background:#f4f4f4;border-radius:10px}}

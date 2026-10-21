@@ -118,7 +118,7 @@ VOL_ACCEL_RATIO = float(os.getenv("VOL_ACCEL_RATIO", "1.8"))  # 1h 거래량이 
 # 1차 자기교정에서 C등급은 peak +63%로 높지만 r1 -27.5%로 최악 = 내부자 펌프덤프 프로파일.
 # 기본값: 알림 없이 관찰만(kind="cgrade"). 1로 두면 기존처럼 알림 발송.
 CROSS_LADDER = (-50, -40, -30, -25, -20, -15, -10, -5, 5, 10, 15, 20, 25, 30, 40, 50)
-BUILD_VERSION = "2026-09-28a"   # 배포 반영 여부 확인용 — 코드 고칠 때마다 갱신
+BUILD_VERSION = "2026-10-22a"   # 배포 반영 여부 확인용 — 코드 고칠 때마다 갱신
 CGRADE_ALERT = os.getenv("CGRADE_ALERT", "0") == "1"
 DIP_ALERT    = os.getenv("DIP_ALERT", "1") == "1"      # 0이면 눌림목 관찰만(기록O·알림X) — 9/8 정산 손절률100%로 강등
 
@@ -234,6 +234,46 @@ def r_pipe(commands):
         return [None] * len(commands)
 
 
+# ============================================================
+# ★ 2026-10-22 Upstash 절감 2차: 휘발성 상태는 메모리로
+# ------------------------------------------------------------
+# 10월 실측 하루 1.7~1.9만 커맨드(월 53만+) → 무료한도 초과.
+# /status 대시보드용으로 '매 사이클' 쓰던 키들(status:main, status:history,
+# pos:snapshot, mkt:now, mkt:activity)은 같은 프로세스의 app.py가
+# 메모리에서 바로 읽으므로 Redis에 쓸 필요가 없음.
+# 재시작 시 첫 사이클(2분) 동안만 비어 보임 — 기능 영향 없음.
+# ============================================================
+MEM = {"status:main": None, "status:history": [], "pos:snapshot": "[]",
+       "mkt:now": None, "mkt:activity": None}
+_MKT = {"base": None, "last_push": 0.0}     # 시장 활성도 baseline (시간당 1샘플만 Redis 기록)
+_POS = {"index": None, "data": {}}          # 포지션 캐시 (/buy·/sell 때만 Redis 쓰기)
+_DD = {}                                    # 2단눌림 관찰 상태 {mint: (만료ts, state)} — 휘발성
+
+
+def pos_index():
+    """포지션 민트 집합. 기동 후 1회만 SMEMBERS, 이후 메모리 (/buy·/sell이 갱신)."""
+    if _POS["index"] is None:
+        res = r_cmd("SMEMBERS", "pos:index")
+        if res is None:
+            return set()          # Redis 실패 → 캐시 안 함, 다음 사이클 재시도
+        _POS["index"] = set(res)
+    return _POS["index"]
+
+
+def pos_get(mint):
+    """포지션 정보 (메모리 캐시, 없으면 GET 1회)."""
+    if mint in _POS["data"]:
+        return _POS["data"][mint]
+    raw = r_cmd("GET", f"pos:{mint}")
+    if not raw:
+        return None
+    try:
+        _POS["data"][mint] = json.loads(raw)
+    except Exception:
+        return None
+    return _POS["data"][mint]
+
+
 def archive_alert(kind, sym, score, pair, tag_verdict=None):
     """발송된 알림을 아카이브 리스트에 기록 (최근 50개 유지).
     kind: 'pump'(급등) / 'dip'(눌림목).
@@ -271,17 +311,20 @@ def market_activity(pairs):
     ratios.sort()
     now_med = ratios[len(ratios) // 2]
 
-    # baseline 리스트 + 시간락을 1회 파이프라인으로 조회
-    res = r_pipe([["LRANGE", "mkt:base", 0, 23], ["GET", "mkt:hourlock"]])
-    base_list = res[0] or []
-    hourlock = res[1]
+    # ★ baseline은 기동 시 1회만 읽고 메모리 유지 (기존: 매 사이클 LRANGE+GET)
+    if _MKT["base"] is None:
+        res = r_pipe([["LRANGE", "mkt:base", 0, 23]])
+        if res and res[0] is not None:
+            _MKT["base"] = list(res[0])
+    base_list = _MKT["base"] or []
 
-    # 시간당 1샘플 축적 (락 없을 때만) — 저장 명령들 묶음
-    writes = [["SET", "mkt:now", round(now_med, 3)]]
-    if not hourlock:
-        writes.append(["SETEX", "mkt:hourlock", 3300, "1"])
-        writes.append(["LPUSH", "mkt:base", round(now_med, 3)])
-        writes.append(["LTRIM", "mkt:base", 0, 23])
+    # 시간당 1샘플만 Redis에 축적 (재시작 대비) — 락도 메모리 시각으로
+    MEM["mkt:now"] = round(now_med, 3)
+    if time.time() - _MKT["last_push"] >= 3300:
+        _MKT["last_push"] = time.time()
+        r_pipe([["LPUSH", "mkt:base", round(now_med, 3)], ["LTRIM", "mkt:base", 0, 23]])
+        if _MKT["base"] is not None:
+            _MKT["base"] = ([str(round(now_med, 3))] + _MKT["base"])[:24]
 
     vals = []
     for x in base_list:
@@ -295,8 +338,7 @@ def market_activity(pairs):
         base = vals[len(vals) // 2]
         if base > 0:
             act = max(0.3, min(2.0, now_med / base))
-            writes.append(["SET", "mkt:activity", round(act, 2)])
-    r_pipe(writes)
+            MEM["mkt:activity"] = round(act, 2)
     return act
 
 
@@ -358,26 +400,24 @@ def check_sell(pair, entry=None, activity=1.0):
 
 def positions_tick(pairs, activity=1.0):
     """매 사이클 포지션 감시: 위험도 점수 알림 + 익절 알림 + 스냅샷 기록."""
-    mints = r_cmd("SMEMBERS", "pos:index") or []
+    # ★ 포지션 없으면 Redis 0회 (기존: 매 사이클 SMEMBERS + SET)
+    mints = list(pos_index())
     if not mints:
-        r_cmd("SET", "pos:snapshot", "[]")
+        MEM["pos:snapshot"] = "[]"
         return
-    # 포지션 정보 + 손절 쿨다운을 1회 파이프라인으로 조회
-    raws = r_pipe([["GET", f"pos:{m}"] for m in mints]
-                  + [["GET", f"slcd:{m}"] for m in mints])
-    pos_raws = raws[:len(mints)]
-    slcd_flags = raws[len(mints):]
+    # 캐시에 없는 포지션만 1회 조회 (보통 기동 직후 한 번)
+    miss = [m for m in mints if m not in _POS["data"]]
+    if miss:
+        for m, raw in zip(miss, r_pipe([["GET", f"pos:{m}"] for m in miss])):
+            if raw:
+                try:
+                    _POS["data"][m] = json.loads(raw)
+                except Exception:
+                    pass
     snapshot = []
-    stale = []
-    for idx, mint in enumerate(mints):
-        raw = pos_raws[idx]
-        if not raw:
-            stale.append(["SREM", "pos:index", mint])
-            continue
-        try:
-            pos = json.loads(raw)
-        except Exception:
-            stale.append(["SREM", "pos:index", mint])
+    for mint in mints:
+        pos = _POS["data"].get(mint)
+        if not pos:
             continue
         pair = pairs.get(mint)
         if not pair:
@@ -394,8 +434,8 @@ def positions_tick(pairs, activity=1.0):
         # 손절선이 뚫린 시점엔 이미 손실 확정이라 위험도 게이지는 의미 없음
         # → 혼란 방지 위해 위험도 숫자 대신 '손절 우선' 메시지로 표시
         sl = float(pos.get("sl") or SELL_SL_PCT)
-        if pnl is not None and pnl <= -sl and not slcd_flags[idx]:
-            r_cmd("SETEX", f"slcd:{mint}", SELL_CRASH_CD, "1")
+        if pnl is not None and pnl <= -sl and not cd_has("slcd", mint):
+            cd_set("slcd", mint, SELL_CRASH_CD)
             tg_send(f"🛑 <b>[손절선 도달] {sym}</b>  손절기준 -{sl:g}%{pnl_txt}\n"
                     f"⚠️ 손실 확정 구간 — 규칙대로면 지금 정리 (위험도 무관)\n"
                     f'📊 <a href="https://dexscreener.com/solana/{pair.get("pairAddress","")}">차트</a>',
@@ -403,8 +443,8 @@ def positions_tick(pairs, activity=1.0):
             print(f"[SL] {sym} {pnl:.1f}%")
 
         # 익절 알림 (위험이 아니라 '기회' → 별도 트랙)
-        if tp_hit and not r_cmd("GET", f"tpcd:{mint}"):
-            r_cmd("SETEX", f"tpcd:{mint}", SELL_SIG_CD, "1")
+        if tp_hit and not cd_has("tpcd", mint):
+            cd_set("tpcd", mint, SELL_SIG_CD)
             tg_send(f"🎯 <b>[익절 검토] {sym}</b>  +{pnl:.0f}% 도달{pnl_txt}\n"
                     f"위험도 {score:.0f}/100 · 목표 {SELL_TP_PCT:.0f}%\n"
                     f'📊 <a href="https://dexscreener.com/solana/{pair.get("pairAddress","")}">차트</a>',
@@ -413,7 +453,7 @@ def positions_tick(pairs, activity=1.0):
 
         # 위험도 알림 (점수 문턱 + 급등 시 쿨다운 무시)
         if score >= SELL_SCORE:
-            prev = r_cmd("GET", f"sellcd:{mint}")
+            prev = cd_val("sellcd", mint) if cd_has("sellcd", mint) else None
             prev_score = None
             if prev:
                 try:
@@ -423,7 +463,7 @@ def positions_tick(pairs, activity=1.0):
             escalated = prev_score is not None and score >= prev_score + SELL_ESCALATE
             if prev_score is None or escalated:
                 cd = SELL_CRASH_CD if any(k == "crash" for k, _, _ in sigs) else SELL_SIG_CD
-                r_cmd("SETEX", f"sellcd:{mint}", cd, score)
+                cd_set("sellcd", mint, cd, score)
                 lines = "\n".join(f"  {t}  <b>+{w:.0f}</b>" for _, t, w in
                                   sorted(sigs, key=lambda x: -x[2]))
                 esc = " ⚠️악화" if escalated else ""
@@ -440,7 +480,7 @@ def positions_tick(pairs, activity=1.0):
         snapshot.append({"sym": sym, "entry": pos.get("entry"), "price": price,
                          "pnl": round(pnl, 1) if pnl is not None else None,
                          "risk": score})
-    r_pipe(stale + [["SET", "pos:snapshot", json.dumps(snapshot)]])
+    MEM["pos:snapshot"] = json.dumps(snapshot)
 
 
 # ============================================================
@@ -891,9 +931,11 @@ def handle_command(text):
             except ValueError:
                 pass
         sym = (pair.get("baseToken") or {}).get("symbol", "?")
-        r_cmd("SET", f"pos:{mint}", json.dumps(
-            {"sym": sym, "entry": price, "ts": int(time.time()), "sl": sl}))
+        _pos = {"sym": sym, "entry": price, "ts": int(time.time()), "sl": sl}
+        r_cmd("SET", f"pos:{mint}", json.dumps(_pos))
         r_cmd("SADD", "pos:index", mint)
+        _POS["data"][mint] = _pos
+        pos_index().add(mint)
         return (f"📌 포지션 등록: <b>{sym}</b> @ ${price:g}\n"
                 f"🛑 손절선 -{sl:g}% · 🎯 익절선 +{SELL_TP_PCT:g}%\n"
                 f"2분 주기 매도감시 시작. 종료는 /sell {mint}")
@@ -902,10 +944,9 @@ def handle_command(text):
         if len(parts) < 2:
             return "사용법: /sell 민트주소"
         mint = parts[1]
-        raw = r_cmd("GET", f"pos:{mint}")
-        if not raw:
+        pos = pos_get(mint)
+        if not pos:
             return "해당 민트의 포지션이 없어"
-        pos = json.loads(raw)
         pair = fetch_one_pair(mint)
         pnl = None
         exit_price = None
@@ -916,6 +957,8 @@ def handle_command(text):
                 pnl = round((exit_price - e) / e * 100, 1)
         r_cmd("SREM", "pos:index", mint)
         r_cmd("DEL", f"pos:{mint}")
+        _POS["data"].pop(mint, None)
+        pos_index().discard(mint)
 
         # 실거래 기록 저장 (자기교정 데이터)
         hold_min = int((time.time() - pos.get("ts", time.time())) / 60)
@@ -955,7 +998,7 @@ def handle_command(text):
         return f"✅ 감시 종료: {pos.get('sym','?')}{pnl_txt}{stats_txt}"
 
     if cmd == "/pos":
-        raw = r_cmd("GET", "pos:snapshot")
+        raw = MEM["pos:snapshot"]
         if not raw or raw == "[]":
             return "보유 포지션 없음. /buy 민트주소 로 등록해"
         try:
@@ -978,9 +1021,9 @@ def handle_command(text):
         if not pair:
             return ("❌ 조회 실패 (DexScreener 응답 없음)\n"
                     "DexScreener rate limit(429)일 가능성이 높아. 30초쯤 뒤 다시 시도해줘.")
-        raw = r_cmd("GET", f"pos:{mint}")
-        entry = json.loads(raw).get("entry") if raw else None
-        act_raw = r_cmd("GET", "mkt:activity")
+        _p = pos_get(mint) if mint in pos_index() else None
+        entry = _p.get("entry") if _p else None
+        act_raw = MEM["mkt:activity"]
         try:
             act = float(act_raw) if act_raw else 1.0
         except (ValueError, TypeError):
@@ -1542,15 +1585,15 @@ def doubledip_tick(pairs):
     if not cands:
         return
 
-    raws = r_pipe([["GET", f"doubledip:{m}"] for m, _, _ in cands])
+    # ★ 상태는 메모리(_DD)에만 — 2시간짜리 휘발성 관찰 상태라 영속화 불필요
+    #   (기존: 후보마다 GET+SETEX = 사이클당 후보수×2 커맨드)
     now = time.time()
+    for k in [k for k, (exp, _) in _DD.items() if exp <= now]:
+        _DD.pop(k, None)
     writes = []
-    for (mint, pair, price), raw in zip(cands, raws):
+    for (mint, pair, price) in cands:
         sym = (pair.get("baseToken") or {}).get("symbol", "?")
-        try:
-            st = json.loads(raw) if raw else None
-        except Exception:
-            st = None
+        st = _DD[mint][1] if mint in _DD else None
 
         if st is None:
             # 최초 관찰: 고점 추적 시작
@@ -1593,8 +1636,11 @@ def doubledip_tick(pairs):
                 st["bounce_high"] = bounce_high
                 writes.append(["SETEX", f"doubledip:{mint}", DOUBLEDIP_STATE_TTL, json.dumps(st)])
 
-    if writes:
-        r_pipe(writes)
+    for w in writes:
+        if w[0] == "DEL":
+            _DD.pop(w[1].split(":", 1)[1], None)
+        else:   # ["SETEX", "doubledip:{mint}", ttl, json]
+            _DD[w[1].split(":", 1)[1]] = (now + w[2], json.loads(w[3]))
 
 
 def vol_accel(pair):
@@ -2172,7 +2218,7 @@ def main():
             # 포지션·성과추적·눌림목추적 코인은 트렌딩에서 빠져도 항상 시세 확보 (감시 필수)
             # ★ Redis 절감: 개별 SMEMBERS 2~3회 → 파이프라인 1회
             # 포지션은 SMEMBERS 1회, 성과추적은 통합맵에서 (커맨드 절감)
-            for pm in (r_cmd("SMEMBERS", "pos:index") or []):
+            for pm in pos_index():
                 mints.add(pm)
             if PERF_ENABLE:
                 for it in pf_load().values():
@@ -2213,16 +2259,14 @@ def main():
 
             # 상태 기록도 파이프라인 1회로 통합 (기존 개별 SET/LPUSH/LTRIM 5회)
             # 상태 기록: 개별 키 5~7개 → 통합 JSON 1개 (커맨드 절감)
+            # ★ 메모리로만 (app.py /status가 같은 프로세스에서 읽음) — 기존 사이클당 1~3 커맨드
             hist = f"{n}:{src['gecko_trend']}:{src['gecko_new']}:{src['dex_boost']}"
-            st_cmds = [["SET", "status:main", json.dumps({
+            MEM["status:main"] = json.dumps({
                 "cycle": cycle, "candidates": n, "last_scan": int(time.time()),
                 "cooldown_skip": skipped_cd, "fresh": len(fresh),
-            })]]
-            # 흐름 이력은 매 사이클 아닌 3사이클(6분)마다만 기록
+            })
             if cycle % 3 == 0:
-                st_cmds.append(["LPUSH", "status:history", hist])
-                st_cmds.append(["LTRIM", "status:history", 0, 19])
-            r_pipe(st_cmds)
+                MEM["status:history"] = ([hist] + MEM["status:history"])[:20]
 
             # 쿨다운 제거된 새 후보 중 상위만 EMA + RugCheck 정밀 검사
             for base_score, mint, pair in fresh[:OHLCV_TOP_N]:

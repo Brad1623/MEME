@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-이벤트 신호 봇 (페이퍼 트레이딩 기록 + 텔레그램 알림) — 빌드 2026-10-22b
+이벤트 신호 봇 (페이퍼 트레이딩 기록 + 텔레그램 알림) — 빌드 2026-10-22d
   FR  펀딩비 숏쏠림 롱      (횡보 쪽 · v5 변형 D)
   VS  거래량 폭발 추종       (추세 쪽 · 2026-10-22 사전등록 검증 A·B 합격)
 
@@ -19,7 +19,8 @@ VS  대상 VS_SYMBOLS 39개 (검증 A·B 코인 합집합)
 구조 (MEME 앱 패턴)
   - app.py 가 start() 호출 → 백그라운드 스레드가 매시 03분 1회 실행
   - Upstash: 상태 전체를 키 1개(fr:state)에 저장. 시간당 SET 1회 + 청산 시 LPUSH 1회 → 월 약 2~3천 커맨드
-  - 시작 시 상태 로드 '실패'면 덮어쓰지 않고 다음 시간 재시도 (9/28 사고 교훈)
+  - Upstash 불가(한도초과 등)면 '메모리 모드'로 신호·알림은 계속. 복구되면 원본과 병합 후 저장
+    (원본 덮어쓰기 없음 · 메모리 모드 중 재시작하면 보유 목록만 초기화)
   - 바이비트는 미국 IP 차단 → Render 리전 Singapore 필요
 """
 import json
@@ -55,7 +56,7 @@ STATE_KEY, CLOSED_KEY = "fr:state", "fr:closed"
 
 fr_bp = Blueprint("funding_bot", __name__)
 _state = None
-_info = {"last_run": None, "last_error": None, "runs": 0, "started": False}
+_info = {"last_run": None, "last_error": None, "runs": 0, "started": False, "persist": True}
 _lock = threading.Lock()
 
 
@@ -70,8 +71,9 @@ def _env(*names):
 
 def r_cmd(*args):
     """(성공여부, 결과). 실패/한도초과를 '키 없음'과 구분."""
-    url = (_env("UPSTASH_REDIS_REST_URL") or "").rstrip("/")
-    tok = _env("UPSTASH_REDIS_REST_TOKEN")
+    # FR_ 접두사가 있으면 신호봇 전용 DB 사용 (스크리너 한도초과와 분리)
+    url = (_env("FR_UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_URL") or "").rstrip("/")
+    tok = _env("FR_UPSTASH_REDIS_REST_TOKEN", "UPSTASH_REDIS_REST_TOKEN")
     try:
         r = requests.post(url, headers={"Authorization": f"Bearer {tok}"},
                           json=[str(a) for a in args], timeout=10)
@@ -304,10 +306,7 @@ def run_once(state, now_ms, get_hist=funding_history, get_px=prices, get_bars=kl
 
 
 # ───────────────── 백그라운드 루프 ─────────────────
-def _load():
-    ok, val = r_cmd("GET", STATE_KEY)
-    if not ok:
-        return None
+def _parse(val):
     try:
         s = {**empty_state(), **(json.loads(val) if val else {})}
         # 구버전(FR 전용) 상태 호환
@@ -322,6 +321,35 @@ def _load():
         return None
 
 
+def _merge(local, remote):
+    """메모리 모드 중 쌓인 상태 + Upstash 원본 병합 (원본 유실 방지)."""
+    for k, v in remote["open"].items():
+        local["open"].setdefault(k, v)
+    for sym, t in remote["seen"].items():
+        local["seen"][sym] = max(t, local["seen"].get(sym, 0))
+    local["vs_bar"] = max(local.get("vs_bar", 0), remote.get("vs_bar", 0))
+    for k, rs in remote["stats"].items():
+        ls = _st(local, k)
+        for f in ("n", "sum_bp", "wins"):
+            ls[f] += rs.get(f, 0)
+    local["weekly"] = max(local["weekly"], remote["weekly"])
+    local["bootstrapped"] = local["bootstrapped"] or remote["bootstrapped"]
+
+
+def _sync():
+    """메모리 모드 → 저장 모드 복귀 시도. 성공하면 True."""
+    ok, val = r_cmd("GET", STATE_KEY)
+    if not ok:
+        return False
+    remote = _parse(val)
+    if remote is None:
+        return False
+    _merge(_state, remote)
+    _info["persist"] = True
+    print("[신호봇] Upstash 복구 → 병합 후 저장 모드 복귀")
+    return True
+
+
 def _loop():
     global _state
     while True:
@@ -332,17 +360,24 @@ def _loop():
                 nxt += timedelta(hours=1)
             time.sleep(max(5, (nxt - now).total_seconds()))
             with _lock:
+                mem_note = None
                 if _state is None:
-                    _state = _load()
+                    ok, val = r_cmd("GET", STATE_KEY)
+                    _state = _parse(val) if ok else None
                     if _state is None:
-                        _info["last_error"] = "Upstash 상태 로드 실패 → 다음 시간 재시도"
-                        continue
+                        _state = empty_state()
+                        _info["persist"] = False
+                if not _info["persist"] and not _sync():
+                    mem_note = "Upstash 사용 불가 → 메모리 모드 (신호·알림 정상, 재시작 시 보유목록 초기화)"
                 changed, rep = run_once(_state, int(time.time() * 1000),
                                         push_closed=lambda rec: r_cmd("LPUSH", CLOSED_KEY, json.dumps(rec)))
-                if changed:
+                if changed and _info["persist"]:
                     ok, err = r_cmd("SET", STATE_KEY, json.dumps(_state))
                     if not ok:
-                        rep["errors"].append(f"상태 저장 실패: {err}")
+                        _info["persist"] = False      # 다음 시간에 병합 후 재시도
+                        rep["errors"].append(f"상태 저장 실패 → 메모리 모드: {str(err)[:100]}")
+                if mem_note:
+                    rep["errors"].append(mem_note)
                 _info["runs"] += 1
                 _info["last_run"] = int(time.time() * 1000)
                 _info["last_error"] = "; ".join(rep["errors"])[:500] or None
@@ -384,6 +419,7 @@ def route_status():
         "보유": [{"전략": v["strat"], "코인": v["symbol"], "방향": "롱" if v["dir"] > 0 else "숏",
                 "진입": fmt_t(v["entry_ms"]), "청산예정": fmt_t(v["exit_ms"]), "진입가": v["entry_px"]}
                for v in sorted(s["open"].values(), key=lambda x: x["exit_ms"])],
+        "저장": "Upstash 저장 중" if _info["persist"] else "메모리 모드 (Upstash 불가)",
         "last_run": fmt_t(_info["last_run"]), "runs": _info["runs"], "last_error": _info["last_error"],
     })
 
@@ -402,8 +438,9 @@ def route_test():
         out["missing_symbols"] = [s for s in ALL_SYMBOLS if s not in px]
     except Exception as e:
         out["prices"] = f"실패: {e}"
-    ok, _ = r_cmd("EXISTS", STATE_KEY)
-    out["upstash"] = "ok" if ok else "실패"
+    ok, res = r_cmd("EXISTS", STATE_KEY)
+    out["upstash"] = "ok" if ok else f"실패: {str(res)[:200]}"
+    out["upstash_db"] = "신호봇 전용(FR_)" if _env("FR_UPSTASH_REDIS_REST_URL") else "스크리너와 공용"
     telegram("[신호봇 연결 테스트] 이 메시지가 보이면 텔레그램 OK")
     out["telegram"] = "전송함 — 텔레그램 확인"
     return jsonify(out)
