@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-이벤트 신호 봇 (페이퍼 트레이딩 기록 + 텔레그램 알림) — 빌드 2026-10-22d
+이벤트 신호 봇 (페이퍼 트레이딩 기록 + 텔레그램 알림) — 빌드 2026-11-17e
   FR  펀딩비 숏쏠림 롱      (횡보 쪽 · v5 변형 D)
   VS  거래량 폭발 추종       (추세 쪽 · 2026-10-22 사전등록 검증 A·B 합격)
 
@@ -48,6 +48,16 @@ VS_VOLZ, VS_ATR_MULT, VS_VOL_N, VS_ATR_N, VS_HOLD_MS = 3.0, 2.0, 50, 14, 12 * 36
 FEE_BP = 11.0
 EXPECT = {"FR": "+50.7bp · 승률 52%", "VS": "+48~72bp (비용 전)"}
 RUN_MINUTE = 3
+
+# 신호 on/off — Render 환경변수로 조절 (0 = 신규 진입 중단, 보유분 청산·기록은 계속)
+#   FR_ENABLE / VS_LONG_ENABLE / VS_SHORT_ENABLE   (기본 1)
+def _flag(name):
+    return os.environ.get(name, "1").strip() not in ("0", "false", "off", "no")
+
+
+FR_ENABLE = _flag("FR_ENABLE")
+VS_LONG_ENABLE = _flag("VS_LONG_ENABLE")
+VS_SHORT_ENABLE = _flag("VS_SHORT_ENABLE")
 
 BYBIT = "https://api.bybit.com"
 KST = timezone(timedelta(hours=9))
@@ -162,6 +172,11 @@ def vs_raw(bars):
     return out
 
 
+def _switches():
+    o = lambda b: "ON" if b else "OFF"
+    return f"FR {o(FR_ENABLE)} · VS롱 {o(VS_LONG_ENABLE)} · VS숏 {o(VS_SHORT_ENABLE)}"
+
+
 def fmt_t(ms):
     return datetime.fromtimestamp(ms / 1000, KST).strftime("%m/%d %H:%M") if ms else "-"
 
@@ -238,7 +253,7 @@ def run_once(state, now_ms, get_hist=funding_history, get_px=prices, get_bars=kl
                 continue
             state["seen"][sym] = t_new
             changed = True
-            if first:
+            if first or not FR_ENABLE:
                 continue
             past = [r for _, r in h[:-1]][-FR_LOOKBACK:]
             pct = mid_pct(past, r_new)
@@ -271,6 +286,8 @@ def run_once(state, now_ms, get_hist=funding_history, get_px=prices, get_bars=kl
                     d, prev = raw[-1], raw[-2]
                     if d == 0 or d == prev:          # 첫 봉만
                         continue
+                    if (d > 0 and not VS_LONG_ENABLE) or (d < 0 and not VS_SHORT_ENABLE):
+                        continue
                     key = f"VS:{sym}:{now_ms}"
                     chg = (bars[-1][4] / bars[-2][4] - 1) * 100
                     state["open"][key] = {"strat": "VS", "symbol": sym, "dir": d, "entry_ms": now_ms,
@@ -287,7 +304,7 @@ def run_once(state, now_ms, get_hist=funding_history, get_px=prices, get_bars=kl
     if first and not rep["errors"]:
         state["bootstrapped"] = True
         changed = True
-        send(f"[신호봇 시작] FR {len(FR_SYMBOLS)}개 · VS {len(VS_SYMBOLS)}개 감시\n"
+        send(f"[신호봇 시작] {_switches()}\n"
              f"매시 {RUN_MINUTE:02d}분 확인 · 규칙 고정(페이퍼)")
 
     # ④ 주간 요약 (월 09시 KST 이후 첫 실행)
@@ -419,6 +436,7 @@ def route_status():
         "보유": [{"전략": v["strat"], "코인": v["symbol"], "방향": "롱" if v["dir"] > 0 else "숏",
                 "진입": fmt_t(v["entry_ms"]), "청산예정": fmt_t(v["exit_ms"]), "진입가": v["entry_px"]}
                for v in sorted(s["open"].values(), key=lambda x: x["exit_ms"])],
+        "신호": _switches(),
         "저장": "Upstash 저장 중" if _info["persist"] else "메모리 모드 (Upstash 불가)",
         "last_run": fmt_t(_info["last_run"]), "runs": _info["runs"], "last_error": _info["last_error"],
     })
